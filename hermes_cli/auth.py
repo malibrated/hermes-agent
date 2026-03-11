@@ -135,6 +135,14 @@ PROVIDER_REGISTRY: Dict[str, ProviderConfig] = {
         api_key_env_vars=("MINIMAX_CN_API_KEY",),
         base_url_env_var="MINIMAX_CN_BASE_URL",
     ),
+    "gemini": ProviderConfig(
+        id="gemini",
+        name="Google Gemini",
+        auth_type="api_key",
+        inference_base_url="https://generativelanguage.googleapis.com/v1beta/openai",
+        api_key_env_vars=("GEMINI_API_KEY", "GOOGLE_API_KEY"),
+        base_url_env_var="GEMINI_BASE_URL",
+    ),
 }
 
 
@@ -465,24 +473,30 @@ def resolve_provider(
     Determine which inference provider to use.
 
     Priority (when requested="auto" or None):
-    1. active_provider in auth.json with valid credentials
-    2. Explicit CLI api_key/base_url -> "openrouter"
-    3. OPENAI_API_KEY or OPENROUTER_API_KEY env vars -> "openrouter"
-    4. Provider-specific API keys (GLM, Kimi, MiniMax) -> that provider
+    1. Explicit CLI api_key/base_url -> "openrouter"
+    2. OPENAI_BASE_URL env var -> "openrouter" (custom/self-hosted endpoint)
+    3. active_provider in auth.json with valid credentials
+    4. OPENAI_API_KEY or OPENROUTER_API_KEY env vars -> "openrouter"
+    5. Provider-specific API keys (GLM, Kimi, MiniMax) -> that provider
     5. Fallback: "openrouter"
     """
     normalized = (requested or "auto").strip().lower()
 
     # Normalize provider aliases
     _PROVIDER_ALIASES = {
+        "local": "custom",
+        "mlx": "mlx",
         "glm": "zai", "z-ai": "zai", "z.ai": "zai", "zhipu": "zai",
         "kimi": "kimi-coding", "moonshot": "kimi-coding",
         "minimax-china": "minimax-cn", "minimax_cn": "minimax-cn",
+        "google": "gemini", "google-ai": "gemini",
     }
     normalized = _PROVIDER_ALIASES.get(normalized, normalized)
 
     if normalized in {"openrouter", "custom"}:
         return "openrouter"
+    if normalized == "mlx":
+        return "mlx"
     if normalized in PROVIDER_REGISTRY:
         return normalized
     if normalized != "auto":
@@ -494,6 +508,14 @@ def resolve_provider(
     # Explicit one-off CLI creds always mean openrouter/custom
     if explicit_api_key or explicit_base_url:
         return "openrouter"
+
+    # A configured OpenAI-compatible base URL is an explicit custom endpoint
+    # choice and should win over any previously logged-in OAuth provider.
+    if os.getenv("OPENAI_BASE_URL", "").strip():
+        return "openrouter"
+
+    if os.getenv("LOCAL_MLX_MODEL", "").strip():
+        return "mlx"
 
     # Check auth store for an active OAuth provider
     try:

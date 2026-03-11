@@ -737,12 +737,14 @@ def cmd_model(args):
 
     provider_labels = {
         "openrouter": "OpenRouter",
+        "mlx": "Local MLX",
         "nous": "Nous Portal",
         "openai-codex": "OpenAI Codex",
         "zai": "Z.AI / GLM",
         "kimi-coding": "Kimi / Moonshot",
         "minimax": "MiniMax",
         "minimax-cn": "MiniMax (China)",
+        "gemini": "Google Gemini",
         "custom": "Custom endpoint",
     }
     active_label = provider_labels.get(active, active)
@@ -755,12 +757,14 @@ def cmd_model(args):
     # Step 1: Provider selection — put active provider first with marker
     providers = [
         ("openrouter", "OpenRouter (100+ models, pay-per-use)"),
+        ("mlx", "Local MLX (direct in-process Apple Silicon inference)"),
         ("nous", "Nous Portal (Nous Research subscription)"),
         ("openai-codex", "OpenAI Codex"),
         ("zai", "Z.AI / GLM (Zhipu AI direct API)"),
         ("kimi-coding", "Kimi / Moonshot (Moonshot AI direct API)"),
         ("minimax", "MiniMax (global direct API)"),
         ("minimax-cn", "MiniMax China (domestic direct API)"),
+        ("gemini", "Google Gemini (direct API)"),
     ]
 
     # Add user-defined custom providers from config.yaml
@@ -788,7 +792,7 @@ def cmd_model(args):
             }
 
     # Always add the manual custom endpoint option last
-    providers.append(("custom", "Custom endpoint (enter URL manually)"))
+    providers.append(("custom", "Custom endpoint (local/self-hosted, enter URL manually)"))
 
     # Add removal option if there are saved custom providers
     if _custom_provider_map:
@@ -815,6 +819,8 @@ def cmd_model(args):
     # Step 2: Provider-specific setup + model selection
     if selected_provider == "openrouter":
         _model_flow_openrouter(config, current_model)
+    elif selected_provider == "mlx":
+        _model_flow_mlx(config, current_model)
     elif selected_provider == "nous":
         _model_flow_nous(config, current_model)
     elif selected_provider == "openai-codex":
@@ -825,7 +831,7 @@ def cmd_model(args):
         _model_flow_named_custom(config, _custom_provider_map[selected_provider])
     elif selected_provider == "remove-custom":
         _remove_custom_provider(config)
-    elif selected_provider in ("zai", "kimi-coding", "minimax", "minimax-cn"):
+    elif selected_provider in ("zai", "kimi-coding", "minimax", "minimax-cn", "gemini"):
         _model_flow_api_key_provider(config, selected_provider, current_model)
 
 
@@ -866,6 +872,20 @@ def _prompt_provider_choice(choices):
         except (KeyboardInterrupt, EOFError):
             print()
             return None
+
+
+def _clear_mlx_env_if_needed():
+    """Clear MLX env vars that would override the provider resolution chain.
+
+    Called when switching to any non-MLX provider so that stale
+    HERMES_INFERENCE_PROVIDER=mlx and LOCAL_MLX_MODEL don't take priority
+    over the config.yaml provider setting.
+    """
+    from hermes_cli.config import get_env_value, save_env_value
+    if (get_env_value("HERMES_INFERENCE_PROVIDER") or "").strip().lower() == "mlx":
+        save_env_value("HERMES_INFERENCE_PROVIDER", "")
+    if (get_env_value("LOCAL_MLX_MODEL") or "").strip():
+        save_env_value("LOCAL_MLX_MODEL", "")
 
 
 def _model_flow_openrouter(config, current_model=""):
@@ -910,6 +930,7 @@ def _model_flow_openrouter(config, current_model=""):
             model["base_url"] = OPENROUTER_BASE_URL
         save_config(cfg)
         deactivate_provider()
+        _clear_mlx_env_if_needed()
         print(f"Default model set to: {selected} (via OpenRouter)")
     else:
         print("No change.")
@@ -987,6 +1008,7 @@ def _model_flow_nous(config, current_model=""):
         if get_env_value("OPENAI_BASE_URL"):
             save_env_value("OPENAI_BASE_URL", "")
             save_env_value("OPENAI_API_KEY", "")
+        _clear_mlx_env_if_needed()
         print(f"Default model set to: {selected} (via Nous Portal)")
     else:
         print("No change.")
@@ -1034,6 +1056,7 @@ def _model_flow_openai_codex(config, current_model=""):
         if get_env_value("OPENAI_BASE_URL"):
             save_env_value("OPENAI_BASE_URL", "")
             save_env_value("OPENAI_API_KEY", "")
+        _clear_mlx_env_if_needed()
         print(f"Default model set to: {selected} (via OpenAI Codex)")
     else:
         print("No change.")
@@ -1094,15 +1117,46 @@ def _model_flow_custom(config):
             model["base_url"] = effective_url
         save_config(cfg)
         deactivate_provider()
+        _clear_mlx_env_if_needed()
 
         print(f"Default model set to: {model_name} (via {effective_url})")
     else:
         if base_url or api_key:
             deactivate_provider()
+            _clear_mlx_env_if_needed()
         print("Endpoint saved. Use `/model` in chat or `hermes model` to set a model.")
 
     # Auto-save to custom_providers so it appears in the menu next time
     _save_custom_provider(effective_url, effective_key, model_name or "")
+
+
+def _model_flow_mlx(config, current_model=""):
+    """Local MLX provider: choose a local model slug and persist it."""
+    from hermes_cli.auth import _save_model_choice, deactivate_provider
+    from hermes_cli.config import load_config, save_config, save_env_value
+    from hermes_cli.models import provider_model_ids
+
+    models = provider_model_ids("mlx")
+    selected = _prompt_model_selection(
+        models,
+        current_model=current_model or os.getenv("LOCAL_MLX_MODEL", ""),
+    )
+    if not selected:
+        print("No change.")
+        return
+
+    save_env_value("LOCAL_MLX_MODEL", selected)
+    save_env_value("HERMES_INFERENCE_PROVIDER", "mlx")
+    _save_model_choice(selected)
+
+    cfg = load_config()
+    model = cfg.get("model")
+    if isinstance(model, dict):
+        model["provider"] = "mlx"
+        model["base_url"] = "mlx://local"
+    save_config(cfg)
+    deactivate_provider()
+    print(f"Default model set to: {selected} (via Local MLX)")
 
 
 def _save_custom_provider(base_url, api_key="", model=""):
@@ -1239,6 +1293,7 @@ def _model_flow_named_custom(config, provider_info):
             model["base_url"] = base_url
         save_config(cfg)
         deactivate_provider()
+        _clear_mlx_env_if_needed()
 
         print(f"✅ Switched to: {saved_model}")
         print(f"   Provider: {name} ({base_url})")
@@ -1311,6 +1366,7 @@ def _model_flow_named_custom(config, provider_info):
         model["base_url"] = base_url
     save_config(cfg)
     deactivate_provider()
+    _clear_mlx_env_if_needed()
 
     # Save model name to the custom_providers entry for next time
     _save_custom_provider(base_url, api_key, model_name)
@@ -1342,6 +1398,15 @@ _PROVIDER_MODELS = {
         "MiniMax-M2.5",
         "MiniMax-M2.5-highspeed",
         "MiniMax-M2.1",
+    ],
+    "gemini": [
+        "gemini-3.1-pro-preview",
+        "gemini-3-pro-preview",
+        "gemini-3-flash-preview",
+        "gemini-2.5-pro",
+        "gemini-2.5-flash",
+        "gemini-2.5-flash-lite",
+        "gemini-2.0-flash",
     ],
 }
 
@@ -1424,6 +1489,7 @@ def _model_flow_api_key_provider(config, provider_id, current_model=""):
             model["base_url"] = effective_base
         save_config(cfg)
         deactivate_provider()
+        _clear_mlx_env_if_needed()
 
         print(f"Default model set to: {selected} (via {pconfig.name})")
     else:
@@ -1860,7 +1926,7 @@ For more help on a command:
     )
     chat_parser.add_argument(
         "--provider",
-        choices=["auto", "openrouter", "nous", "openai-codex", "zai", "kimi-coding", "minimax", "minimax-cn"],
+        choices=["auto", "openrouter", "custom", "local", "nous", "openai-codex", "zai", "kimi-coding", "minimax", "minimax-cn"],
         default=None,
         help="Inference provider (default: auto)"
     )

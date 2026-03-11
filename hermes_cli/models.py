@@ -8,9 +8,11 @@ Add, remove, or reorder entries here — both `hermes setup` and
 from __future__ import annotations
 
 import json
+import os
 import urllib.request
 import urllib.error
 from difflib import get_close_matches
+from pathlib import Path
 from typing import Any, Optional
 
 # (model_id, display description shown in menus)
@@ -31,6 +33,11 @@ OPENROUTER_MODELS: list[tuple[str, str]] = [
 ]
 
 _PROVIDER_MODELS: dict[str, list[str]] = {
+    "mlx": [
+        "mlx-community/Qwen3-8B-4bit",
+        "mlx-community/Qwen3-14B-4bit",
+        "mlx-community/Qwen3-30B-A3B-4bit",
+    ],
     "zai": [
         "glm-5",
         "glm-4.7",
@@ -53,6 +60,15 @@ _PROVIDER_MODELS: dict[str, list[str]] = {
         "MiniMax-M2.5-highspeed",
         "MiniMax-M2.1",
     ],
+    "gemini": [
+        "gemini-3.1-pro-preview",
+        "gemini-3-pro-preview",
+        "gemini-3-flash-preview",
+        "gemini-2.5-pro",
+        "gemini-2.5-flash",
+        "gemini-2.5-flash-lite",
+        "gemini-2.0-flash",
+    ],
 }
 
 _PROVIDER_LABELS = {
@@ -63,10 +79,14 @@ _PROVIDER_LABELS = {
     "kimi-coding": "Kimi / Moonshot",
     "minimax": "MiniMax",
     "minimax-cn": "MiniMax (China)",
+    "gemini": "Google Gemini",
+    "mlx": "Local MLX",
     "custom": "Custom endpoint",
 }
 
 _PROVIDER_ALIASES = {
+    "local": "custom",
+    "mlx-local": "mlx",
     "glm": "zai",
     "z-ai": "zai",
     "z.ai": "zai",
@@ -75,6 +95,8 @@ _PROVIDER_ALIASES = {
     "moonshot": "kimi-coding",
     "minimax-china": "minimax-cn",
     "minimax_cn": "minimax-cn",
+    "google": "gemini",
+    "google-ai": "gemini",
 }
 
 
@@ -95,7 +117,7 @@ def menu_labels() -> list[str]:
 _KNOWN_PROVIDER_NAMES: set[str] = (
     set(_PROVIDER_LABELS.keys())
     | set(_PROVIDER_ALIASES.keys())
-    | {"openrouter", "custom"}
+    | {"openrouter", "custom", "local"}
 )
 
 
@@ -107,8 +129,8 @@ def list_available_providers() -> list[dict[str, str]]:
     """
     # Canonical providers in display order
     _PROVIDER_ORDER = [
-        "openrouter", "nous", "openai-codex",
-        "zai", "kimi-coding", "minimax", "minimax-cn",
+        "openrouter", "mlx", "custom", "nous", "openai-codex",
+        "zai", "kimi-coding", "minimax", "minimax-cn", "gemini",
     ]
     # Build reverse alias map
     aliases_for: dict[str, list[str]] = {}
@@ -193,6 +215,55 @@ def provider_model_ids(provider: Optional[str]) -> list[str]:
 
         return get_codex_model_ids()
     return list(_PROVIDER_MODELS.get(normalized, []))
+
+
+def available_mlx_models() -> list[str]:
+    """Return deduplicated local/direct MLX model choices.
+
+    Preference order:
+    1. Explicit env/config selections
+    2. Curated MLX repo ids
+    3. Locally cached LM Studio MLX model directories
+    """
+    choices: list[str] = []
+
+    def _add(value: Optional[str]) -> None:
+        item = (value or "").strip()
+        if item and item not in choices:
+            choices.append(item)
+
+    _add(os.getenv("LOCAL_MLX_MODEL"))
+    _add(os.getenv("LOCAL_MLX_AUX_MODEL"))
+    _add(os.getenv("LLM_MODEL"))
+
+    try:
+        from hermes_cli.config import load_config
+
+        cfg = load_config()
+        model_cfg = cfg.get("model")
+        if isinstance(model_cfg, dict):
+            if normalize_provider(model_cfg.get("provider")) == "mlx":
+                _add(model_cfg.get("default"))
+        elif isinstance(model_cfg, str):
+            _add(model_cfg)
+    except Exception:
+        pass
+
+    for mid in _PROVIDER_MODELS.get("mlx", []):
+        _add(mid)
+
+    cache_root = Path.home() / ".cache" / "lm-studio" / "models"
+    if cache_root.exists():
+        for provider_dir in sorted(cache_root.iterdir()):
+            if not provider_dir.is_dir():
+                continue
+            for model_dir in sorted(provider_dir.iterdir()):
+                if not model_dir.is_dir():
+                    continue
+                if (model_dir / "config.json").exists():
+                    _add(str(model_dir))
+
+    return choices
 
 
 def fetch_api_models(

@@ -519,11 +519,12 @@ def setup_model_provider(config: dict):
         "Login with Nous Portal (Nous Research subscription)",
         "Login with OpenAI Codex",
         "OpenRouter API key (100+ models, pay-per-use)",
-        "Custom OpenAI-compatible endpoint (self-hosted / VLLM / etc.)",
+        "Custom / local OpenAI-compatible endpoint (self-hosted / VLLM / etc.)",
         "Z.AI / GLM (Zhipu AI models)",
         "Kimi / Moonshot (Kimi coding models)",
         "MiniMax (global endpoint)",
         "MiniMax China (mainland China endpoint)",
+        "Google Gemini (direct API)",
     ]
     if keep_label:
         provider_choices.append(keep_label)
@@ -856,12 +857,46 @@ def setup_model_provider(config: dict):
             save_env_value("OPENAI_API_KEY", "")
         _update_config_for_provider("minimax-cn", pconfig.inference_base_url)
 
-    # else: provider_idx == 8 (Keep current) — only shown when a provider already exists
+    elif provider_idx == 8:  # Google Gemini
+        selected_provider = "gemini"
+        print()
+        print_header("Google Gemini API Key")
+        pconfig = PROVIDER_REGISTRY["gemini"]
+        print_info(f"Provider: {pconfig.name}")
+        print_info(f"Base URL: {pconfig.inference_base_url}")
+        print_info("Get your API key at: https://aistudio.google.com/apikey")
+        print()
+
+        existing_key = get_env_value("GEMINI_API_KEY") or get_env_value("GOOGLE_API_KEY")
+        api_key = existing_key
+        if existing_key:
+            print_info(f"Current: {existing_key[:8]}... (configured)")
+            if prompt_yes_no("Update API key?", False):
+                new_key = prompt("  Gemini API key", password=True)
+                if new_key:
+                    api_key = new_key
+                    save_env_value("GEMINI_API_KEY", api_key)
+                    print_success("Gemini API key updated")
+        else:
+            api_key = prompt("  Gemini API key", password=True)
+            if api_key:
+                save_env_value("GEMINI_API_KEY", api_key)
+                print_success("Gemini API key saved")
+            else:
+                print_warning("Skipped - agent won't work without an API key")
+
+        # Clear custom endpoint vars if switching
+        if existing_custom:
+            save_env_value("OPENAI_BASE_URL", "")
+            save_env_value("OPENAI_API_KEY", "")
+        _update_config_for_provider("gemini", pconfig.inference_base_url)
+
+    # else: provider_idx == 9 (Keep current) — only shown when a provider already exists
 
     # ── OpenRouter API Key for tools (if not already set) ──
     # Tools (vision, web, MoA) use OpenRouter independently of the main provider.
     # Prompt for OpenRouter key if not set and a non-OpenRouter provider was chosen.
-    if selected_provider in ("nous", "openai-codex", "custom", "zai", "kimi-coding", "minimax", "minimax-cn") and not get_env_value("OPENROUTER_API_KEY"):
+    if selected_provider in ("nous", "openai-codex", "custom", "zai", "kimi-coding", "minimax", "minimax-cn", "gemini") and not get_env_value("OPENROUTER_API_KEY"):
         print()
         print_header("OpenRouter API Key (for tools)")
         print_info("Tools like vision analysis, web search, and MoA use OpenRouter")
@@ -874,6 +909,40 @@ def setup_model_provider(config: dict):
             print_success("OpenRouter API key saved (for tools)")
         else:
             print_info("Skipped - some tools (vision, web scraping) won't work without this")
+
+    # ── Clear env vars that would override the provider we just selected ──
+    # HERMES_INFERENCE_PROVIDER and LOCAL_MLX_MODEL in .env take priority over
+    # config.yaml, so they must be updated when switching providers.
+    if selected_provider is not None:
+        if selected_provider == "mlx":
+            save_env_value("HERMES_INFERENCE_PROVIDER", "mlx")
+        else:
+            # Clear MLX-specific env vars that trigger MLX auto-detection
+            current_inference_provider = get_env_value("HERMES_INFERENCE_PROVIDER") or ""
+            if current_inference_provider.strip().lower() == "mlx":
+                save_env_value("HERMES_INFERENCE_PROVIDER", "")
+            current_mlx_model = get_env_value("LOCAL_MLX_MODEL") or ""
+            if current_mlx_model.strip():
+                save_env_value("LOCAL_MLX_MODEL", "")
+
+    # ── Sync in-memory config with what _update_config_for_provider wrote to disk ──
+    # _update_config_for_provider writes provider/base_url to the on-disk config.yaml
+    # but the in-memory `config` dict still has the old value. Reload the model section
+    # so the model selection step below preserves provider/base_url correctly.
+    try:
+        _disk_model = load_config().get("model")
+        if isinstance(_disk_model, dict):
+            config["model"] = _disk_model
+    except Exception:
+        pass
+
+    # Helper: set the model name in config without clobbering provider/base_url.
+    def _set_model_in_config(model_name: str) -> None:
+        if isinstance(config.get("model"), dict):
+            config["model"]["default"] = model_name
+        else:
+            config["model"] = model_name
+        save_env_value("LLM_MODEL", model_name)
 
     # ── Model Selection (adapts based on provider) ──
     if selected_provider != "custom":  # Custom already prompted for model name
@@ -898,11 +967,11 @@ def setup_model_provider(config: dict):
             model_idx = prompt_choice("Select default model:", model_choices, len(model_choices) - 1)
 
             if model_idx < len(nous_models):
-                config['model'] = nous_models[model_idx]
+                _set_model_in_config(nous_models[model_idx])
             elif model_idx == len(model_choices) - 2:  # Custom
                 model_name = prompt("  Model name")
                 if model_name:
-                    config['model'] = model_name
+                    _set_model_in_config(model_name)
             # else: keep current
 
         elif selected_provider == "nous":
@@ -912,8 +981,7 @@ def setup_model_provider(config: dict):
             print_info("Enter a Nous model name manually (e.g., claude-opus-4-6).")
             custom = prompt(f"  Model name (Enter to keep '{current_model}')")
             if custom:
-                config['model'] = custom
-                save_env_value("LLM_MODEL", custom)
+                _set_model_in_config(custom)
         elif selected_provider == "openai-codex":
             from hermes_cli.codex_models import get_codex_model_ids
             codex_models = get_codex_model_ids()
@@ -926,13 +994,11 @@ def setup_model_provider(config: dict):
 
             model_idx = prompt_choice("Select default model:", model_choices, default_codex)
             if model_idx < len(codex_models):
-                config['model'] = codex_models[model_idx]
-                save_env_value("LLM_MODEL", codex_models[model_idx])
+                _set_model_in_config(codex_models[model_idx])
             elif model_idx == len(codex_models):
                 custom = prompt("Enter model name")
                 if custom:
-                    config['model'] = custom
-                    save_env_value("LLM_MODEL", custom)
+                    _set_model_in_config(custom)
             _update_config_for_provider("openai-codex", DEFAULT_CODEX_BASE_URL)
         elif selected_provider == "zai":
             # Coding Plan endpoints don't have GLM-5
@@ -949,13 +1015,11 @@ def setup_model_provider(config: dict):
             model_idx = prompt_choice("Select default model:", model_choices, keep_idx)
 
             if model_idx < len(zai_models):
-                config['model'] = zai_models[model_idx]
-                save_env_value("LLM_MODEL", zai_models[model_idx])
+                _set_model_in_config(zai_models[model_idx])
             elif model_idx == len(zai_models):
                 custom = prompt("Enter model name")
                 if custom:
-                    config['model'] = custom
-                    save_env_value("LLM_MODEL", custom)
+                    _set_model_in_config(custom)
             # else: keep current
         elif selected_provider == "kimi-coding":
             kimi_models = ["kimi-k2.5", "kimi-k2-thinking", "kimi-k2-turbo-preview"]
@@ -967,13 +1031,11 @@ def setup_model_provider(config: dict):
             model_idx = prompt_choice("Select default model:", model_choices, keep_idx)
 
             if model_idx < len(kimi_models):
-                config['model'] = kimi_models[model_idx]
-                save_env_value("LLM_MODEL", kimi_models[model_idx])
+                _set_model_in_config(kimi_models[model_idx])
             elif model_idx == len(kimi_models):
                 custom = prompt("Enter model name")
                 if custom:
-                    config['model'] = custom
-                    save_env_value("LLM_MODEL", custom)
+                    _set_model_in_config(custom)
             # else: keep current
         elif selected_provider in ("minimax", "minimax-cn"):
             minimax_models = ["MiniMax-M2.5", "MiniMax-M2.5-highspeed", "MiniMax-M2.1"]
@@ -985,14 +1047,28 @@ def setup_model_provider(config: dict):
             model_idx = prompt_choice("Select default model:", model_choices, keep_idx)
 
             if model_idx < len(minimax_models):
-                config['model'] = minimax_models[model_idx]
-                save_env_value("LLM_MODEL", minimax_models[model_idx])
+                _set_model_in_config(minimax_models[model_idx])
             elif model_idx == len(minimax_models):
                 custom = prompt("Enter model name")
                 if custom:
-                    config['model'] = custom
-                    save_env_value("LLM_MODEL", custom)
+                    _set_model_in_config(custom)
             # else: keep current
+        elif selected_provider == "gemini":
+            gemini_models = ["gemini-3.1-pro-preview", "gemini-3-pro-preview", "gemini-3-flash-preview", "gemini-2.5-pro", "gemini-2.5-flash", "gemini-2.5-flash-lite", "gemini-2.0-flash"]
+            model_choices = list(gemini_models)
+            model_choices.append("Custom model")
+            model_choices.append(f"Keep current ({current_model})")
+
+            keep_idx = len(model_choices) - 1
+            model_idx = prompt_choice("Select default model:", model_choices, keep_idx)
+
+            chosen_model = None
+            if model_idx < len(gemini_models):
+                _set_model_in_config(gemini_models[model_idx])
+            elif model_idx == len(gemini_models):
+                custom = prompt("Enter model name")
+                if custom:
+                    _set_model_in_config(custom)
         else:
             # Static list for OpenRouter / fallback (from canonical list)
             from hermes_cli.models import model_ids, menu_labels
@@ -1007,13 +1083,11 @@ def setup_model_provider(config: dict):
             model_idx = prompt_choice("Select default model:", model_choices, keep_idx)
 
             if model_idx < len(ids):
-                config['model'] = ids[model_idx]
-                save_env_value("LLM_MODEL", ids[model_idx])
+                _set_model_in_config(ids[model_idx])
             elif model_idx == len(ids):  # Custom
                 custom = prompt("Enter model name (e.g., anthropic/claude-opus-4.6)")
                 if custom:
-                    config['model'] = custom
-                    save_env_value("LLM_MODEL", custom)
+                    _set_model_in_config(custom)
             # else: Keep current
 
         _final_model = config.get('model', '')

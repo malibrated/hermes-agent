@@ -17,6 +17,7 @@ import os
 import shutil
 import sys
 import json
+import time
 import atexit
 import uuid
 from pathlib import Path
@@ -73,6 +74,14 @@ os.environ.setdefault("MSWEA_GLOBAL_CONFIG_DIR", str(_hermes_home))
 # =============================================================================
 # Configuration Loading
 # =============================================================================
+
+
+def _truncate_text(text: str, max_len: int) -> str:
+    if len(text) <= max_len:
+        return text
+    if max_len <= 3:
+        return text[:max_len]
+    return text[: max_len - 3] + "..."
 
 def _load_prefill_messages(file_path: str) -> List[Dict[str, Any]]:
     """Load ephemeral prefill messages from a JSON file.
@@ -1051,7 +1060,7 @@ class HermesCLI:
         Args:
             model: Model to use (default: from env or claude-sonnet)
             toolsets: List of toolsets to enable (default: all)
-            provider: Inference provider ("auto", "openrouter", "nous", "openai-codex", "zai", "kimi-coding", "minimax", "minimax-cn")
+            provider: Inference provider ("auto", "openrouter", "custom", "local", "nous", "openai-codex", "zai", "kimi-coding", "minimax", "minimax-cn")
             api_key: API key (default: from environment)
             base_url: API base URL (default: OpenRouter)
             max_turns: Maximum tool-calling iterations shared with subagents (default: 90)
@@ -1070,13 +1079,28 @@ class HermesCLI:
         self.bell_on_complete = CLI_CONFIG["display"].get("bell_on_complete", False)
         self.verbose = verbose if verbose is not None else (self.tool_progress_mode == "verbose")
         
-        # Configuration - priority: CLI args > env vars > config file
-        # Model can come from: CLI arg, LLM_MODEL env, OPENAI_MODEL env (custom endpoint), or config
-        self.model = model or os.getenv("LLM_MODEL") or os.getenv("OPENAI_MODEL") or CLI_CONFIG["model"]["default"]
+        # Configuration - priority is normally CLI args > env vars > config file.
+        # For direct MLX, prefer the configured model/defaults so a stale LLM_MODEL
+        # env var from an older OpenRouter/custom setup cannot silently override the
+        # active local model selection.
+        cfg_model = CLI_CONFIG["model"]["default"]
+        cfg_provider = str(CLI_CONFIG["model"].get("provider", "auto") or "auto").strip().lower()
+        mlx_model = os.getenv("LOCAL_MLX_MODEL")
+        if model:
+            self.model = model
+        elif cfg_provider == "mlx":
+            self.model = mlx_model or cfg_model or os.getenv("LLM_MODEL") or os.getenv("OPENAI_MODEL")
+        else:
+            self.model = os.getenv("LLM_MODEL") or os.getenv("OPENAI_MODEL") or cfg_model
         # Track whether model was explicitly chosen by the user or fell back
         # to the global default.  Provider-specific normalisation may override
         # the default silently but should warn when overriding an explicit choice.
-        self._model_is_default = not (model or os.getenv("LLM_MODEL") or os.getenv("OPENAI_MODEL"))
+        self._model_is_default = not (
+            model
+            or os.getenv("LOCAL_MLX_MODEL")
+            or os.getenv("LLM_MODEL")
+            or os.getenv("OPENAI_MODEL")
+        )
 
         self._explicit_api_key = api_key
         self._explicit_base_url = base_url
@@ -1186,6 +1210,12 @@ class HermesCLI:
         # History file for persistent input recall across sessions
         self._history_file = Path.home() / ".hermes_history"
         self._last_invalidate: float = 0.0  # throttle UI repaints
+        self._dream_idle_enabled = os.getenv("HERMES_DREAM_IDLE_ENABLED", "").strip().lower() in {"1", "true", "yes", "on"}
+        self._dream_idle_seconds = int(os.getenv("HERMES_DREAM_IDLE_SECONDS", "300") or "300")
+        self._dream_idle_cadence = int(os.getenv("HERMES_DREAM_IDLE_CADENCE_SECONDS", "900") or "900")
+        self._last_activity_monotonic = time.monotonic()
+        self._last_dream_monotonic = 0.0
+        self._dream_review_items: List[Dict[str, Any]] = []
 
     def _invalidate(self, min_interval: float = 0.25) -> None:
         """Throttled UI repaint — prevents terminal blinking on slow/SSH connections."""
@@ -1393,10 +1423,11 @@ class HermesCLI:
                 try:
                     self._session_db.set_session_title(self.session_id, self._pending_title)
                     _cprint(f"  Session title applied: {self._pending_title}")
-                    self._pending_title = None
                 except (ValueError, Exception) as e:
                     _cprint(f"  Could not apply pending title: {e}")
                     self._pending_title = None
+            self._pending_title = None
+            self._last_activity_monotonic = time.monotonic()
             return True
         except Exception as e:
             self.console.print(f"[bold red]Failed to initialize agent: {e}[/]")
@@ -1783,12 +1814,35 @@ class HermesCLI:
         provider_info = f" [dim #B8860B]·[/] [dim]provider: {self.provider}[/]"
         if self._provider_source:
             provider_info += f" [dim #B8860B]·[/] [dim]auth: {self._provider_source}[/]"
+        memory_info = ""
+        memory_summary = self._get_memory_status_summary()
+        if memory_summary:
+            memory_info = f" [dim #B8860B]·[/] [dim]{memory_summary}[/]"
 
         self.console.print(
             f"  {api_indicator} [#FFBF00]{model_short}[/] "
             f"[dim #B8860B]·[/] [bold cyan]{tool_count} tools[/]"
-            f"{toolsets_info}{provider_info}"
+            f"{toolsets_info}{provider_info}{memory_info}"
         )
+
+    def _get_memory_status_summary(self) -> str:
+        if not self.agent or not getattr(self.agent, "_memory_graph", None):
+            return ""
+        try:
+            summary = self.agent._memory_graph.memory_dashboard(session_id=self.session_id)
+        except Exception:
+            return ""
+        pending_review = summary.get("prune_candidates", 0) + summary.get("merge_candidates", 0)
+        parts = [
+            f"goals:{summary.get('active_goals', 0)}",
+            f"blockers:{summary.get('active_blockers', 0)}",
+            f"hyp:{summary.get('active_hypotheses', 0)}",
+        ]
+        if pending_review:
+            parts.append(f"review:{pending_review}")
+        if self._dream_idle_enabled:
+            parts.append("dream:auto")
+        return "memory " + " ".join(parts)
     
     def show_help(self):
         """Display help information."""
@@ -2002,6 +2056,7 @@ class HermesCLI:
         if self.agent and self.conversation_history:
             try:
                 self.agent.flush_memories(self.conversation_history)
+                self.agent.run_memory_maintenance()
             except Exception:
                 pass
         self.conversation_history = []
@@ -2396,11 +2451,60 @@ class HermesCLI:
             self.show_toolsets()
         elif cmd_lower == "/config":
             self.show_config()
+        elif cmd_lower.startswith("/dream"):
+            parts = cmd_original.split(maxsplit=3)
+            sub = parts[1].lower() if len(parts) > 1 else ""
+            if sub == "status":
+                print("DreamCycle status:")
+                print(f"  Auto-idle enabled:   {'yes' if self._dream_idle_enabled else 'no'}")
+                print(f"  Idle threshold:      {self._dream_idle_seconds}s")
+                print(f"  Minimum cadence:     {self._dream_idle_cadence}s")
+                if self._last_dream_monotonic > 0:
+                    age = max(0, int(time.monotonic() - self._last_dream_monotonic))
+                    print(f"  Last dream:          {age}s ago")
+                else:
+                    print("  Last dream:          not yet run")
+            elif sub == "auto":
+                mode = parts[2].strip().lower() if len(parts) > 2 else ""
+                if mode in {"on", "enable", "enabled"}:
+                    self._dream_idle_enabled = True
+                    print("(^_^)b Idle DreamCycle enabled")
+                elif mode in {"off", "disable", "disabled"}:
+                    self._dream_idle_enabled = False
+                    print("(^_^)b Idle DreamCycle disabled")
+                else:
+                    print("Usage: /dream auto on|off")
+            elif sub == "review":
+                review_sub = parts[2].lower() if len(parts) > 2 else ""
+                review_arg = parts[3].strip() if len(parts) > 3 else ""
+                self._handle_dream_review(review_sub, review_arg)
+            else:
+                focus = cmd_original[len("/dream"):].strip()
+                if focus.lower().startswith(("status", "auto", "review")):
+                    focus = ""
+                if not self.agent:
+                    print("(._.) Agent not initialized.")
+                else:
+                    result = self.agent.run_dream_cycle(focus=focus)
+                    self._last_dream_monotonic = time.monotonic()
+                    if not result:
+                        print("(._.) Dream cycle unavailable.")
+                    else:
+                        print("(^_^)b Dream cycle complete")
+                        print(f"  Packet size:         {result.get('packet_size', 0)}")
+                        print(f"  Heuristic hypotheses:{len(result.get('heuristic_hypotheses', []))}")
+                        print(f"  Dream hypotheses:    {len(result.get('dream_hypotheses', []))}")
+                        print(f"  Experiment plans:    {len(result.get('experiment_plans', []))}")
+                        print(f"  Prune candidates:    {len(result.get('prune_candidates', []))}")
+                        self._refresh_dream_review_items()
+        elif cmd_lower.startswith("/memory"):
+            self._handle_memory_command(cmd_original)
         elif cmd_lower == "/clear":
             # Flush memories before clearing
             if self.agent and self.conversation_history:
                 try:
                     self.agent.flush_memories(self.conversation_history)
+                    self.agent.run_memory_maintenance()
                 except Exception:
                     pass
             # Clear terminal screen.  Inside the TUI, Rich's console.clear()
@@ -2562,6 +2666,9 @@ class HermesCLI:
                         saved_model = save_config_value("model.default", new_model)
                         if provider_changed:
                             save_config_value("model.provider", target_provider)
+                            # Persist the base_url so the runtime resolver uses the right endpoint
+                            if base_url_for_probe:
+                                save_config_value("model.base_url", base_url_for_probe)
                         if saved_model:
                             print(f"(^_^)b Model changed to: {new_model}{provider_note} (saved to config)")
                         else:
@@ -2740,6 +2847,407 @@ class HermesCLI:
             )
         except Exception as e:
             print(f"  ❌ Compression failed: {e}")
+
+    def _handle_memory_command(self, cmd: str):
+        if not self.agent or not getattr(self.agent, "_memory_graph", None):
+            print("(._.) Memory graph is not available.")
+            return
+        parts = cmd.split(maxsplit=2)
+        sub = parts[1].lower() if len(parts) > 1 else "packet"
+        graph = self.agent._memory_graph
+        active_task_id = None
+        if self.conversation_history:
+            try:
+                active_task_id = self.agent.session_id
+            except Exception:
+                active_task_id = None
+
+        if sub == "packet":
+            query = parts[2].strip() if len(parts) > 2 else ""
+            packet = graph.retrieve_working_memory(
+                query=query,
+                session_id=self.agent.session_id,
+                limit=8,
+            )
+            if not packet:
+                print("(._.) No working-memory packet items.")
+                return
+            print("Working memory packet:")
+            for item in packet:
+                print(
+                    f"  - [{item['type']}|{item['status']}] {item['title']} "
+                    f"(node_id={item['node_id']}, score={item['score']:.3f}, why={item['why_relevant']})"
+                )
+                print(f"    {item['brief']}")
+        elif sub in {"dashboard", "status"}:
+            summary = graph.memory_dashboard(session_id=self.agent.session_id, task_id=active_task_id)
+            print("Memory dashboard:")
+            print(f"  Total nodes:        {summary['total_nodes']}")
+            print(f"  Active goals:       {summary['active_goals']}")
+            print(f"  Active blockers:    {summary['active_blockers']}")
+            print(f"  Active hypotheses:  {summary['active_hypotheses']}")
+            print(f"  Dream artifacts:    {summary['dream_artifacts']}")
+            print(f"  Prune candidates:   {summary['prune_candidates']}")
+            print(f"  Merge candidates:   {summary['merge_candidates']}")
+        elif sub == "expand":
+            if len(parts) < 3:
+                print("(._.) Usage: /memory expand <node_id>")
+                return
+            expanded = graph.expand_memory_node(parts[2].strip())
+            if not expanded:
+                print("(._.) Memory node not found.")
+                return
+            node = expanded["node"]
+            print(f"[{node['type']}|{node['status']}] {node.get('title') or node['type']} ({node['id']})")
+            print(node.get("content") or "")
+            for nei in expanded.get("neighbors") or []:
+                print(f"  -> ({nei['edge_type']}) {nei['title']} [{nei['related_id']}]")
+            for evt in expanded.get("events") or []:
+                print(f"  * {evt['event_type']} {evt['timestamp']} {evt['reason']}")
+        elif sub in {"hypotheses", "hypothesis"}:
+            rows = graph.list_nodes(
+                node_type="hypothesis",
+                session_id=self.agent.session_id,
+                limit=10,
+            )
+            if not rows:
+                print("(._.) No hypothesis nodes.")
+                return
+            for row in rows:
+                print(f"  - [{row['status']}] {row.get('title') or 'hypothesis'} ({row['id']})")
+                print(f"    {_truncate_text(str(row.get('content') or ''), 180).replace(chr(10), ' ')}")
+        elif sub in {"merge-candidates", "merge"}:
+            rows = graph.list_events(
+                event_type="merge_candidate",
+                session_id=self.agent.session_id,
+                limit=10,
+            )
+            if not rows:
+                print("(._.) No merge candidates.")
+                return
+            for row in rows:
+                payload = graph._parse_metadata(row.get("payload_json"))
+                print(f"  - {row['timestamp']} {row['node_id']} -> {row['related_node_id']} sim={payload.get('similarity')}")
+        elif sub in {"prune-candidates", "prune"}:
+            rows = graph.list_nodes(
+                source_kind="dreamcycle_prune_candidate",
+                session_id=self.agent.session_id,
+                limit=10,
+            )
+            if not rows:
+                print("(._.) No prune candidates.")
+                return
+            for row in rows:
+                meta = graph._parse_metadata(row.get("metadata_json"))
+                print(f"  - {row['id']} target={meta.get('target_node_id')}")
+                print(f"    {row.get('content') or ''}")
+        elif sub == "prune-approve":
+            if len(parts) < 3:
+                print("(._.) Usage: /memory prune-approve <candidate_id>")
+                return
+            if graph.review_prune_candidate(
+                candidate_id=parts[2].strip(),
+                action="approve",
+                session_id=self.agent.session_id,
+                task_id=active_task_id,
+            ):
+                print("(^_^)b Prune candidate approved and target archived")
+            else:
+                print("(._.) Could not approve prune candidate.")
+        elif sub == "prune-reject":
+            if len(parts) < 3:
+                print("(._.) Usage: /memory prune-reject <candidate_id>")
+                return
+            if graph.review_prune_candidate(
+                candidate_id=parts[2].strip(),
+                action="reject",
+                session_id=self.agent.session_id,
+                task_id=active_task_id,
+            ):
+                print("(^_^)b Prune candidate rejected; target kept")
+            else:
+                print("(._.) Could not reject prune candidate.")
+        elif sub == "merge-approve":
+            merge_parts = cmd.split(maxsplit=3)
+            if len(merge_parts) < 4:
+                print("(._.) Usage: /memory merge-approve <canonical_node_id> <duplicate_node_id>")
+                return
+            if graph.review_merge_candidate(
+                canonical_node_id=merge_parts[2].strip(),
+                duplicate_node_id=merge_parts[3].strip(),
+                action="approve",
+                session_id=self.agent.session_id,
+                task_id=active_task_id,
+            ):
+                print("(^_^)b Merge candidate approved; duplicate superseded")
+            else:
+                print("(._.) Could not approve merge candidate.")
+        elif sub == "merge-reject":
+            merge_parts = cmd.split(maxsplit=3)
+            if len(merge_parts) < 4:
+                print("(._.) Usage: /memory merge-reject <canonical_node_id> <duplicate_node_id>")
+                return
+            if graph.review_merge_candidate(
+                canonical_node_id=merge_parts[2].strip(),
+                duplicate_node_id=merge_parts[3].strip(),
+                action="reject",
+                session_id=self.agent.session_id,
+                task_id=active_task_id,
+            ):
+                print("(^_^)b Merge candidate rejected; memories kept separate")
+            else:
+                print("(._.) Could not reject merge candidate.")
+        elif sub in {"dreams", "review"}:
+            rows = graph.list_nodes(
+                session_id=self.agent.session_id,
+                limit=12,
+            )
+            dream_rows = [
+                row for row in rows
+                if row.get("source_kind") in {
+                    "dreamcycle_hypothesis",
+                    "dreamcycle_experiment",
+                    "dreamcycle_prune_candidate",
+                }
+            ]
+            if not dream_rows:
+                print("(._.) No recent dream artifacts.")
+                return
+            print("Recent dream artifacts:")
+            for row in dream_rows:
+                print(
+                    f"  - [{row['type']}|{row['status']}] {row.get('title') or row['type']} "
+                    f"({row['id']}, source={row.get('source_kind') or 'n/a'})"
+                )
+                print(f"    {_truncate_text(str(row.get('content') or ''), 180).replace(chr(10), ' ')}")
+        else:
+            print("Usage:")
+            print("  /memory dashboard")
+            print("  /memory packet [query]")
+            print("  /memory expand <node_id>")
+            print("  /memory hypotheses")
+            print("  /memory merge-candidates")
+            print("  /memory merge-approve <canonical_node_id> <duplicate_node_id>")
+            print("  /memory merge-reject <canonical_node_id> <duplicate_node_id>")
+            print("  /memory prune-candidates")
+            print("  /memory prune-approve <candidate_id>")
+            print("  /memory prune-reject <candidate_id>")
+            print("  /memory dreams")
+
+    def _refresh_dream_review_items(self) -> List[Dict[str, Any]]:
+        if not self.agent or not getattr(self.agent, "_memory_graph", None):
+            self._dream_review_items = []
+            return []
+        graph = self.agent._memory_graph
+        items: List[Dict[str, Any]] = []
+
+        prune_rows = graph.list_nodes(
+            source_kind="dreamcycle_prune_candidate",
+            session_id=self.agent.session_id,
+            limit=10,
+        )
+        for row in prune_rows:
+            meta = graph._parse_metadata(row.get("metadata_json"))
+            items.append(
+                {
+                    "kind": "prune_candidate",
+                    "label": row.get("title") or "Dream prune candidate",
+                    "summary": str(row.get("content") or ""),
+                    "candidate_id": str(row["id"]),
+                    "target_node_id": str(meta.get("target_node_id") or ""),
+                    "source_kind": row.get("source_kind"),
+                    "status": row.get("status"),
+                }
+            )
+
+        merge_rows = graph.list_events(
+            event_type="merge_candidate",
+            session_id=self.agent.session_id,
+            limit=10,
+        )
+        for row in merge_rows:
+            payload = graph._parse_metadata(row.get("payload_json"))
+            items.append(
+                {
+                    "kind": "merge_candidate",
+                    "label": f"{row['node_id']} -> {row['related_node_id']}",
+                    "summary": f"semantic similarity={payload.get('similarity')}",
+                    "canonical_node_id": str(row["node_id"] or ""),
+                    "duplicate_node_id": str(row["related_node_id"] or ""),
+                    "status": "pending",
+                    "timestamp": row.get("timestamp"),
+                }
+            )
+
+        dream_rows = graph.list_nodes(
+            session_id=self.agent.session_id,
+            limit=20,
+        )
+        for row in dream_rows:
+            if row.get("source_kind") not in {
+                "dreamcycle_hypothesis",
+                "dreamcycle_experiment",
+            }:
+                continue
+            items.append(
+                {
+                    "kind": "dream_artifact",
+                    "label": row.get("title") or row.get("type") or "dream artifact",
+                    "summary": str(row.get("content") or ""),
+                    "node_id": str(row["id"]),
+                    "status": row.get("status"),
+                    "source_kind": row.get("source_kind"),
+                }
+            )
+
+        self._dream_review_items = items
+        return items
+
+    def _show_dream_review_queue(self) -> None:
+        items = self._refresh_dream_review_items()
+        if not items:
+            print("(._.) No dream review items.")
+            return
+        print("Dream review queue:")
+        for idx, item in enumerate(items, start=1):
+            action_hint = "expand"
+            if item["kind"] in {"merge_candidate", "prune_candidate"}:
+                action_hint = "expand|approve|reject"
+            print(
+                f"  {idx}. [{item['kind']}] {item['label']} "
+                f"(status={item.get('status') or 'n/a'}, actions={action_hint})"
+            )
+            print(f"     {_truncate_text(item.get('summary') or '', 140).replace(chr(10), ' ')}")
+        print("Use /dream review expand <n>, /dream review approve <n>, or /dream review reject <n>.")
+
+    def _handle_dream_review(self, sub: str, arg: str) -> None:
+        if not self.agent or not getattr(self.agent, "_memory_graph", None):
+            print("(._.) Memory graph is not available.")
+            return
+        if sub in {"", "list"}:
+            self._show_dream_review_queue()
+            return
+        if sub == "refresh":
+            self._show_dream_review_queue()
+            return
+        if sub not in {"expand", "approve", "reject"}:
+            print("Usage: /dream review [refresh|expand <n>|approve <n>|reject <n>]")
+            return
+        if not arg:
+            print(f"(._.) Usage: /dream review {sub} <n>")
+            return
+        try:
+            index = int(arg)
+        except ValueError:
+            print(f"(._.) Usage: /dream review {sub} <n>")
+            return
+        items = self._dream_review_items or self._refresh_dream_review_items()
+        if index < 1 or index > len(items):
+            print("(._.) Review item index out of range.")
+            return
+        item = items[index - 1]
+        graph = self.agent._memory_graph
+        if sub == "expand":
+            if item["kind"] == "dream_artifact":
+                expanded = graph.expand_memory_node(item["node_id"])
+                if not expanded:
+                    print("(._.) Memory node not found.")
+                    return
+                node = expanded["node"]
+                print(f"[{node['type']}|{node['status']}] {node.get('title') or node['type']} ({node['id']})")
+                print(node.get("content") or "")
+                for nei in expanded.get("neighbors") or []:
+                    print(f"  -> ({nei['edge_type']}) {nei['title']} [{nei['related_id']}]")
+                return
+            if item["kind"] == "prune_candidate":
+                print(f"[prune_candidate] {item['label']} ({item['candidate_id']})")
+                print(item["summary"])
+                if item.get("target_node_id"):
+                    expanded = graph.expand_memory_node(item["target_node_id"])
+                    if expanded:
+                        node = expanded["node"]
+                        print(f"  target: [{node['type']}|{node['status']}] {node.get('title') or node['type']} ({node['id']})")
+                        print(f"  {_truncate_text(str(node.get('content') or ''), 200).replace(chr(10), ' ')}")
+                return
+            if item["kind"] == "merge_candidate":
+                print(f"[merge_candidate] {item['label']}")
+                left = graph.expand_memory_node(item["canonical_node_id"])
+                right = graph.expand_memory_node(item["duplicate_node_id"])
+                if left:
+                    node = left["node"]
+                    print(f"  canonical: [{node['type']}|{node['status']}] {node.get('title') or node['type']} ({node['id']})")
+                    print(f"  {_truncate_text(str(node.get('content') or ''), 160).replace(chr(10), ' ')}")
+                if right:
+                    node = right["node"]
+                    print(f"  duplicate: [{node['type']}|{node['status']}] {node.get('title') or node['type']} ({node['id']})")
+                    print(f"  {_truncate_text(str(node.get('content') or ''), 160).replace(chr(10), ' ')}")
+                return
+        elif sub == "approve":
+            if item["kind"] == "prune_candidate":
+                ok = graph.review_prune_candidate(
+                    candidate_id=item["candidate_id"],
+                    action="approve",
+                    session_id=self.agent.session_id,
+                    task_id=self.agent.session_id,
+                )
+                print("(^_^)b Prune candidate approved" if ok else "(._.) Could not approve prune candidate.")
+                self._refresh_dream_review_items()
+                return
+            if item["kind"] == "merge_candidate":
+                ok = graph.review_merge_candidate(
+                    canonical_node_id=item["canonical_node_id"],
+                    duplicate_node_id=item["duplicate_node_id"],
+                    action="approve",
+                    session_id=self.agent.session_id,
+                    task_id=self.agent.session_id,
+                )
+                print("(^_^)b Merge candidate approved" if ok else "(._.) Could not approve merge candidate.")
+                self._refresh_dream_review_items()
+                return
+            print("(._.) This review item is informational only.")
+            return
+        elif sub == "reject":
+            if item["kind"] == "prune_candidate":
+                ok = graph.review_prune_candidate(
+                    candidate_id=item["candidate_id"],
+                    action="reject",
+                    session_id=self.agent.session_id,
+                    task_id=self.agent.session_id,
+                )
+                print("(^_^)b Prune candidate rejected" if ok else "(._.) Could not reject prune candidate.")
+                self._refresh_dream_review_items()
+                return
+            if item["kind"] == "merge_candidate":
+                ok = graph.review_merge_candidate(
+                    canonical_node_id=item["canonical_node_id"],
+                    duplicate_node_id=item["duplicate_node_id"],
+                    action="reject",
+                    session_id=self.agent.session_id,
+                    task_id=self.agent.session_id,
+                )
+                print("(^_^)b Merge candidate rejected" if ok else "(._.) Could not reject merge candidate.")
+                self._refresh_dream_review_items()
+                return
+            print("(._.) This review item is informational only.")
+
+    def _maybe_run_idle_dreamcycle(self):
+        if not self._dream_idle_enabled or self._agent_running or self._should_exit:
+            return
+        if not self.agent or not getattr(self.agent, "_memory_graph", None):
+            return
+        now = time.monotonic()
+        if now - self._last_activity_monotonic < self._dream_idle_seconds:
+            return
+        if now - self._last_dream_monotonic < self._dream_idle_cadence:
+            return
+        result = self.agent.run_dream_cycle(focus="idle background maintenance", max_hypotheses=2)
+        self._last_dream_monotonic = now
+        if result:
+            print("\n💭 Dream cycle ran during idle time")
+            print(
+                f"   hypotheses={len(result.get('heuristic_hypotheses', [])) + len(result.get('dream_hypotheses', []))} "
+                f"plans={len(result.get('experiment_plans', []))} prune={len(result.get('prune_candidates', []))}"
+            )
 
     def _show_usage(self):
         """Show cumulative token usage for the current session."""
@@ -3656,6 +4164,10 @@ class HermesCLI:
                     ('class:clarify-countdown', countdown),
                 ]
 
+            memory_summary = cli_ref._get_memory_status_summary()
+            if memory_summary:
+                return [('class:hint', f'  {memory_summary}')]
+
             return []
 
         def get_hint_height():
@@ -3663,7 +4175,9 @@ class HermesCLI:
                 return 1
             # Keep a 1-line spacer while agent runs so output doesn't push
             # right up against the top rule of the input area
-            return 1 if cli_ref._agent_running else 0
+            if cli_ref._agent_running:
+                return 1
+            return 1 if cli_ref._get_memory_status_summary() else 0
 
         spacer = Window(
             content=FormattedTextControl(get_hint_text),
@@ -3912,10 +4426,13 @@ class HermesCLI:
                     try:
                         user_input = self._pending_input.get(timeout=0.1)
                     except queue.Empty:
+                        self._maybe_run_idle_dreamcycle()
                         continue
                     
                     if not user_input:
                         continue
+
+                    self._last_activity_monotonic = time.monotonic()
 
                     # Unpack image payload: (text, [Path, ...]) or plain str
                     submit_images = []
@@ -3993,6 +4510,7 @@ class HermesCLI:
             if self.agent and self.conversation_history:
                 try:
                     self.agent.flush_memories(self.conversation_history)
+                    self.agent.run_memory_maintenance()
                 except Exception:
                     pass
             # Unregister terminal_tool callbacks to avoid dangling references
@@ -4038,7 +4556,7 @@ def main(
         q: Shorthand for --query
         toolsets: Comma-separated list of toolsets to enable (e.g., "web,terminal")
         model: Model to use (default: anthropic/claude-opus-4-20250514)
-        provider: Inference provider ("auto", "openrouter", "nous", "openai-codex", "zai", "kimi-coding", "minimax", "minimax-cn")
+            provider: Inference provider ("auto", "openrouter", "custom", "local", "nous", "openai-codex", "zai", "kimi-coding", "minimax", "minimax-cn")
         api_key: API key for authentication
         base_url: Base URL for the API
         max_turns: Maximum tool-calling iterations (default: 60)
