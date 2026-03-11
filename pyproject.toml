@@ -51,6 +51,7 @@ honcho = ["honcho-ai>=2.0.1"]
 mcp = ["mcp>=1.2.0"]
 homeassistant = ["aiohttp>=3.9.0"]
 yc-bench = ["yc-bench @ git+https://github.com/collinear-ai/yc-bench.git"]
+mlx = ["mlx", "mlx-lm", "mlx-embeddings", "sqlite-vec"]
 all = [
   "hermes-agent[modal]",
   "hermes-agent[daytona]",
@@ -64,6 +65,7 @@ all = [
   "hermes-agent[honcho]",
   "hermes-agent[mcp]",
   "hermes-agent[homeassistant]",
+  "hermes-agent[mlx]",
 ]
 
 [project.scripts]

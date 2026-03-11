@@ -148,6 +148,16 @@ def resolve_runtime_provider(
             "requested_provider": requested_provider,
         }
 
+    if provider == "mlx":
+        return {
+            "provider": "mlx",
+            "api_mode": "mlx_local",
+            "base_url": "mlx://local",
+            "api_key": "mlx-local",
+            "source": "env/config",
+            "requested_provider": requested_provider,
+        }
+
     # API-key providers (z.ai/GLM, Kimi, MiniMax, MiniMax-CN)
     pconfig = PROVIDER_REGISTRY.get(provider)
     if pconfig and pconfig.auth_type == "api_key":

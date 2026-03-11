@@ -100,6 +100,12 @@ def _clear_provider_env(monkeypatch):
 class TestResolveProvider:
     """Test resolve_provider() with new providers."""
 
+    def test_explicit_custom(self):
+        assert resolve_provider("custom") == "openrouter"
+
+    def test_alias_local(self):
+        assert resolve_provider("local") == "openrouter"
+
     def test_explicit_zai(self):
         assert resolve_provider("zai") == "zai"
 

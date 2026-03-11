@@ -142,6 +142,49 @@ class TestHasContentAfterThinkBlock:
         assert agent._has_content_after_think_block("just normal content") is True
 
 
+class TestIntermediateAckDetection:
+    def test_detects_workspace_ack_before_tools(self, agent):
+        messages = [{"role": "user", "content": "look at the repo and explain it"}]
+        assert agent._looks_like_intermediate_ack(
+            user_message="look at the repo and explain it",
+            assistant_content="I'll inspect the repository first and report back.",
+            messages=messages,
+        ) is True
+
+    def test_ignores_ack_after_tool_results_exist(self, agent):
+        messages = [
+            {"role": "user", "content": "look at the repo"},
+            {"role": "tool", "tool_call_id": "c1", "content": "{}"},
+        ]
+        assert agent._looks_like_intermediate_ack(
+            user_message="look at the repo",
+            assistant_content="I'll inspect the repository first and report back.",
+            messages=messages,
+        ) is False
+
+    def test_detects_post_tool_stub_for_substantive_request(self, agent):
+        messages = [
+            {"role": "user", "content": "look at the repo and explain how it works"},
+            {"role": "tool", "tool_call_id": "c1", "content": "{}"},
+        ]
+        assert agent._looks_like_post_tool_stub(
+            user_message="look at the repo and explain how it works",
+            assistant_content="Done.",
+            messages=messages,
+        ) is True
+
+    def test_ignores_post_tool_stub_for_non_substantive_request(self, agent):
+        messages = [
+            {"role": "user", "content": "search something"},
+            {"role": "tool", "tool_call_id": "c1", "content": "{}"},
+        ]
+        assert agent._looks_like_post_tool_stub(
+            user_message="search something",
+            assistant_content="Done searching",
+            messages=messages,
+        ) is False
+
+
 class TestStripThinkBlocks:
     def test_none_returns_empty(self, agent):
         assert agent._strip_think_blocks(None) == ""
@@ -828,6 +871,75 @@ class TestRunConversation:
         mock_compress.assert_called_once()
         assert result["final_response"] == "All done"
         assert result["completed"] is True
+
+    def test_local_endpoint_ack_message_forces_continuation(self, agent):
+        self._setup_agent(agent)
+        agent.base_url = "http://127.0.0.1:1234/v1"
+
+        tc = _mock_tool_call(name="web_search", arguments='{}', call_id="c1")
+        resp1 = _mock_response(
+            content="I'll inspect the repository first and then summarize the findings.",
+            finish_reason="stop",
+        )
+        resp2 = _mock_response(content="", finish_reason="tool_calls", tool_calls=[tc])
+        resp3 = _mock_response(content="Architecture summary complete.", finish_reason="stop")
+        agent.client.chat.completions.create.side_effect = [resp1, resp2, resp3]
+
+        with (
+            patch("run_agent.handle_function_call", return_value="search result"),
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("look at the repo and explain how it works")
+
+        assert result["completed"] is True
+        assert result["final_response"] == "Architecture summary complete."
+        assert result["api_calls"] == 3
+        assert any(
+            msg.get("role") == "assistant"
+            and msg.get("finish_reason") == "incomplete"
+            and "inspect the repository" in (msg.get("content") or "")
+            for msg in result["messages"]
+        )
+        assert any(
+            msg.get("role") == "user"
+            and "Continue now. Execute the required tool calls" in (msg.get("content") or "")
+            for msg in result["messages"]
+        )
+
+    def test_local_endpoint_post_tool_stub_forces_final_answer(self, agent):
+        self._setup_agent(agent)
+        agent.base_url = "http://127.0.0.1:1234/v1"
+
+        tc = _mock_tool_call(name="web_search", arguments='{}', call_id="c1")
+        resp1 = _mock_response(content="", finish_reason="tool_calls", tool_calls=[tc])
+        resp2 = _mock_response(content="Done.", finish_reason="stop")
+        resp3 = _mock_response(content="Architecture summary complete.", finish_reason="stop")
+        agent.client.chat.completions.create.side_effect = [resp1, resp2, resp3]
+
+        with (
+            patch("run_agent.handle_function_call", return_value="search result"),
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("look at the repo and explain how it works")
+
+        assert result["completed"] is True
+        assert result["final_response"] == "Architecture summary complete."
+        assert result["api_calls"] == 3
+        assert any(
+            msg.get("role") == "assistant"
+            and msg.get("finish_reason") == "incomplete"
+            and (msg.get("content") or "").strip() == "Done."
+            for msg in result["messages"]
+        )
+        assert any(
+            msg.get("role") == "user"
+            and "you have not yet given the user the actual final answer" in (msg.get("content") or "").lower()
+            for msg in result["messages"]
+        )
 
 
 class TestRetryExhaustion:

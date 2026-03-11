@@ -97,6 +97,9 @@ from agent.trajectory import (
     convert_scratchpad_to_think, has_incomplete_scratchpad,
     save_trajectory as _save_trajectory_to_file,
 )
+from agent.local_mlx import build_local_mlx_client
+from agent.dreamcycle import DreamCycle
+from agent.subconscious import SubconsciousSelector
 
 
 class IterationBudget:
@@ -393,7 +396,10 @@ class AIAgent:
         
         self._client_kwargs = client_kwargs  # stored for rebuilding after interrupt
         try:
-            self.client = OpenAI(**client_kwargs)
+            if self.api_mode == "mlx_local" or self.provider == "mlx":
+                self.client = build_local_mlx_client(model_name=self.model)
+            else:
+                self.client = OpenAI(**client_kwargs)
             if not self.quiet_mode:
                 print(f"🤖 AI Agent initialized with model: {self.model}")
                 if base_url:
@@ -508,6 +514,7 @@ class AIAgent:
         
         # Persistent memory (MEMORY.md + USER.md) -- loaded from disk
         self._memory_store = None
+        self._memory_graph = None
         self._memory_enabled = False
         self._user_profile_enabled = False
         self._memory_nudge_interval = 10
@@ -527,6 +534,11 @@ class AIAgent:
                         user_char_limit=mem_config.get("user_char_limit", 1375),
                     )
                     self._memory_store.load_from_disk()
+                    try:
+                        from agent.memory_graph import MemoryGraphStore
+                        self._memory_graph = MemoryGraphStore()
+                    except Exception as mg_exc:
+                        logger.debug("Memory graph init failed: %s", mg_exc)
             except Exception:
                 pass  # Memory is optional -- don't break agent init
         
@@ -654,7 +666,7 @@ class AIAgent:
             return ""
         return re.sub(r'<think>.*?</think>', '', content, flags=re.DOTALL)
 
-    def _looks_like_codex_intermediate_ack(
+    def _looks_like_intermediate_ack(
         self,
         user_message: str,
         assistant_content: str,
@@ -724,6 +736,96 @@ class AIAgent:
             marker in assistant_text for marker in workspace_markers
         )
         return (user_targets_workspace or assistant_targets_workspace) and assistant_mentions_action
+
+    def _supports_ack_continuations(self) -> bool:
+        """Return True when the current backend benefits from forced continuation.
+
+        Codex already emits explicit incomplete phases, and local/custom
+        OpenAI-compatible endpoints commonly produce short acknowledgement
+        messages before the actual tool call or answer.  Hosted OpenRouter
+        models are typically more reliable here, so keep the heuristic off
+        unless the endpoint is clearly custom/local.
+        """
+        if self.api_mode == "codex_responses" or self.provider == "openai-codex":
+            return True
+
+        base = (self.base_url or "").strip().lower()
+        if not base:
+            return False
+
+        # Treat any non-OpenRouter HTTP endpoint as custom/local.
+        return (
+            base.startswith("http://")
+            or base.startswith("https://")
+        ) and "openrouter.ai" not in base
+
+    def _ack_continuation_limit(self) -> int:
+        """How many forced continuation nudges to allow for this backend."""
+        if self.api_mode == "codex_responses" or self.provider == "openai-codex":
+            return 2
+        if self._supports_ack_continuations():
+            return 1
+        return 0
+
+    @staticmethod
+    def _messages_since_last_user(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Return messages after the most recent user turn."""
+        for idx in range(len(messages) - 1, -1, -1):
+            msg = messages[idx]
+            if isinstance(msg, dict) and msg.get("role") == "user":
+                return messages[idx + 1:]
+        return list(messages)
+
+    def _looks_like_post_tool_stub(
+        self,
+        user_message: str,
+        assistant_content: str,
+        messages: List[Dict[str, Any]],
+    ) -> bool:
+        """Detect generic post-tool wrap-up text where the real answer is missing."""
+        recent = self._messages_since_last_user(messages)
+        if not any(isinstance(msg, dict) and msg.get("role") == "tool" for msg in recent):
+            return False
+
+        assistant_text = self._strip_think_blocks(assistant_content or "").strip().lower()
+        if not assistant_text or len(assistant_text) > 160:
+            return False
+
+        # If the model already produced a substantive answer alongside the tool
+        # call, do not force another pass.
+        if getattr(self, "_last_content_with_tools", None):
+            return False
+
+        generic_stub_patterns = (
+            r"^(done|done\.)$",
+            r"^(completed|completed\.)$",
+            r"^(finished|finished\.)$",
+            r"^(all done|all set|done searching|done checking)[.!]?$",
+            r"^(it'?s done|that'?s done|that is done)[.!]?$",
+            r"^(i (finished|completed|checked|inspected|reviewed) (it|that|the repo|the repository))[.!]?$",
+        )
+        if not any(re.match(pattern, assistant_text) for pattern in generic_stub_patterns):
+            return False
+
+        user_text = (user_message or "").strip().lower()
+        substantive_request_markers = (
+            "explain",
+            "summarize",
+            "summary",
+            "list",
+            "tell me",
+            "walk through",
+            "walk me through",
+            "how it works",
+            "report back",
+            "what did you find",
+            "what you found",
+            "analy",
+            "review",
+            "compare",
+            "describe",
+        )
+        return any(marker in user_text for marker in substantive_request_markers)
     
     
     def _extract_reasoning(self, assistant_message) -> Optional[str]:
@@ -815,6 +917,13 @@ class AIAgent:
                 tool_call_id=msg.get("tool_call_id"),
                 finish_reason=msg.get("finish_reason"),
             )
+            if self._memory_graph and role == "user":
+                user_text = (content or "").strip()
+                if user_text:
+                    self._memory_graph.record_session_goal(
+                        session_id=self.session_id,
+                        content=user_text,
+                    )
         except Exception as e:
             logger.debug("Session DB log_msg failed: %s", e)
 
@@ -1430,6 +1539,101 @@ class AIAgent:
             prompt_parts.append(PLATFORM_HINTS[platform_key])
 
         return "\n\n".join(prompt_parts)
+
+    def _build_working_memory_prompt(self, *, query: str, task_id: str, limit: int = 6) -> str:
+        if not self._memory_graph:
+            return ""
+        try:
+            packet = self._memory_graph.retrieve_working_memory(
+                query=query,
+                session_id=self.session_id,
+                task_id=task_id,
+                limit=limit,
+            )
+        except Exception as exc:
+            logger.debug("Working memory retrieval failed: %s", exc)
+            return ""
+        if not packet:
+            return ""
+        lines = [
+            "Working memory packet:",
+            "Each item includes a stable node_id pointer to the full stored memory record. Use the brief unless deeper detail is necessary.",
+        ]
+        for item in packet:
+            lines.append(
+                f"- [{item['type']}|{item['status']}] {item['title']} "
+                f"(node_id={item['node_id']}, score={item['score']:.3f}, why={item['why_relevant']}): {item['brief']}"
+            )
+        return "\n".join(lines)
+
+    def _build_subconscious_memory_prompt(self, *, query: str, task_id: str, limit: int = 6, max_expand: int = 2) -> str:
+        if not self._memory_graph:
+            return ""
+        try:
+            packet = self._memory_graph.retrieve_working_memory(
+                query=query,
+                session_id=self.session_id,
+                task_id=task_id,
+                limit=limit,
+            )
+        except Exception as exc:
+            logger.debug("Working memory retrieval failed: %s", exc)
+            return ""
+        if not packet:
+            return ""
+
+        selector = SubconsciousSelector()
+        try:
+            expand_ids = selector.choose_expansions(query=query, packet=packet, max_expand=max_expand)
+        except Exception as exc:
+            logger.debug("Subconscious selector failed: %s", exc)
+            expand_ids = []
+
+        lines = [
+            "Working memory packet:",
+            "Each item includes a stable node_id pointer to the full stored memory record. Use the brief unless deeper detail is necessary.",
+        ]
+        for item in packet:
+            lines.append(
+                f"- [{item['type']}|{item['status']}] {item['title']} "
+                f"(node_id={item['node_id']}, score={item['score']:.3f}, why={item['why_relevant']}): {item['brief']}"
+            )
+
+        expanded_blocks = []
+        for node_id in expand_ids:
+            try:
+                expanded = self._memory_graph.expand_memory_node(node_id)
+            except Exception as exc:
+                logger.debug("Memory expansion failed for %s: %s", node_id, exc)
+                continue
+            if not expanded:
+                continue
+            node = expanded["node"]
+            block_lines = [
+                f"Expanded memory record: node_id={node['id']} [{node.get('type')}|{node.get('status')}] {node.get('title') or node.get('type') or 'memory'}",
+                f"Content: {str(node.get('content') or '').strip()}",
+            ]
+            neighbors = expanded.get("neighbors") or []
+            if neighbors:
+                block_lines.append("Related memories:")
+                for nei in neighbors[:4]:
+                    block_lines.append(
+                        f"- ({nei['edge_type']}) {nei['title']} [node_id={nei['related_id']}, {nei['type']}|{nei['status']}]: {nei['brief']}"
+                    )
+            events = expanded.get("events") or []
+            if events:
+                block_lines.append("Recent memory events:")
+                for evt in events[:4]:
+                    block_lines.append(
+                        f"- {evt['event_type']} @ {evt['timestamp']}: {evt['reason']}"
+                    )
+            expanded_blocks.append("\n".join(block_lines))
+
+        if expanded_blocks:
+            lines.append("")
+            lines.append("Subconscious expansions:")
+            lines.extend(expanded_blocks)
+        return "\n".join(lines)
     
     def _invalidate_system_prompt(self):
         """
@@ -2038,6 +2242,39 @@ class AIAgent:
             return terminal_response
         raise RuntimeError("Responses create(stream=True) fallback did not emit a terminal response.")
 
+    def _build_runtime_client(self, *, api_key: Optional[str] = None, base_url: Optional[str] = None):
+        """Build the active runtime client for the current provider/api mode."""
+        if self.api_mode == "mlx_local" or self.provider == "mlx":
+            return build_local_mlx_client(model_name=self.model)
+
+        client_kwargs = dict(self._client_kwargs)
+        if api_key is not None:
+            client_kwargs["api_key"] = api_key
+        if base_url is not None:
+            client_kwargs["base_url"] = base_url
+        return OpenAI(**client_kwargs)
+
+    def _rebuild_runtime_client(self, *, api_key: Optional[str] = None, base_url: Optional[str] = None) -> bool:
+        """Close and rebuild the active runtime client."""
+        try:
+            close_fn = getattr(self.client, "close", None)
+            if callable(close_fn):
+                close_fn()
+        except Exception:
+            pass
+
+        if api_key is not None:
+            self._client_kwargs["api_key"] = api_key
+        if base_url is not None:
+            self._client_kwargs["base_url"] = base_url
+
+        try:
+            self.client = self._build_runtime_client(api_key=api_key, base_url=base_url)
+            return True
+        except Exception as exc:
+            logger.warning("Failed to rebuild runtime client: %s", exc)
+            return False
+
     def _try_refresh_codex_client_credentials(self, *, force: bool = True) -> bool:
         if self.api_mode != "codex_responses" or self.provider != "openai-codex":
             return False
@@ -2062,15 +2299,8 @@ class AIAgent:
         self._client_kwargs["api_key"] = self.api_key
         self._client_kwargs["base_url"] = self.base_url
 
-        try:
-            self.client.close()
-        except Exception:
-            pass
-
-        try:
-            self.client = OpenAI(**self._client_kwargs)
-        except Exception as exc:
-            logger.warning("Failed to rebuild OpenAI client after Codex refresh: %s", exc)
+        if not self._rebuild_runtime_client(api_key=self.api_key, base_url=self.base_url):
+            logger.warning("Failed to rebuild client after Codex refresh")
             return False
 
         return True
@@ -2105,15 +2335,8 @@ class AIAgent:
         # Nous requests should not inherit OpenRouter-only attribution headers.
         self._client_kwargs.pop("default_headers", None)
 
-        try:
-            self.client.close()
-        except Exception:
-            pass
-
-        try:
-            self.client = OpenAI(**self._client_kwargs)
-        except Exception as exc:
-            logger.warning("Failed to rebuild OpenAI client after Nous refresh: %s", exc)
+        if not self._rebuild_runtime_client(api_key=self.api_key, base_url=self.base_url):
+            logger.warning("Failed to rebuild client after Nous refresh")
             return False
 
         return True
@@ -2149,10 +2372,7 @@ class AIAgent:
                 except Exception:
                     pass
                 # Rebuild the client for future calls (cheap, no network)
-                try:
-                    self.client = OpenAI(**self._client_kwargs)
-                except Exception:
-                    pass
+                self._rebuild_runtime_client()
                 raise InterruptedError("Agent interrupted during API call")
         if result["error"] is not None:
             raise result["error"]
@@ -2194,13 +2414,17 @@ class AIAgent:
                 import hermes_cli.auth as _auth
                 resolver = getattr(_auth, resolver_name)
                 creds = resolver()
-                return creds["api_key"], creds["base_url"], api_mode
+                return creds["api_key"], creds["base_url"], api_mode, (fb_config.get("model") or "").strip()
             except Exception as e:
                 logging.warning(
                     "Fallback to %s failed (credential resolution): %s",
                     fb_provider, e,
                 )
                 return None
+
+        if fb_provider == "mlx":
+            fb_model = (fb_config.get("model") or "").strip() or os.getenv("LOCAL_MLX_MODEL") or self.model
+            return "mlx-local", "mlx://local", "mlx_local", fb_model
 
         # ── 2. API-key providers ──────────────────────────────────────
         fb_key = (fb_config.get("api_key") or "").strip()
@@ -2227,7 +2451,7 @@ class AIAgent:
         if not fb_base_url:
             fb_base_url = OPENROUTER_BASE_URL
 
-        return fb_key, fb_base_url, "chat_completions"
+        return fb_key, fb_base_url, "chat_completions", (fb_config.get("model") or "").strip()
 
     def _try_activate_fallback(self) -> bool:
         """Switch to the configured fallback model/provider.
@@ -2249,27 +2473,28 @@ class AIAgent:
         resolved = self._resolve_fallback_credentials(fb_provider, fb)
         if resolved is None:
             return False
-        fb_key, fb_base_url, fb_api_mode = resolved
+        fb_key, fb_base_url, fb_api_mode, resolved_model = resolved
 
         # Build new client
         try:
             client_kwargs = {"api_key": fb_key, "base_url": fb_base_url}
-            if "openrouter" in fb_base_url.lower():
+            if fb_api_mode == "chat_completions" and "openrouter" in fb_base_url.lower():
                 client_kwargs["default_headers"] = {
                     "HTTP-Referer": "https://github.com/NousResearch/hermes-agent",
                     "X-OpenRouter-Title": "Hermes Agent",
                     "X-OpenRouter-Categories": "productivity,cli-agent",
                 }
-            elif "api.kimi.com" in fb_base_url.lower():
+            elif fb_api_mode == "chat_completions" and "api.kimi.com" in fb_base_url.lower():
                 client_kwargs["default_headers"] = {"User-Agent": "KimiCLI/1.0"}
 
-            self.client = OpenAI(**client_kwargs)
             self._client_kwargs = client_kwargs
             old_model = self.model
-            self.model = fb_model
+            self.model = resolved_model or fb_model
             self.provider = fb_provider
             self.base_url = fb_base_url
             self.api_mode = fb_api_mode
+            if not self._rebuild_runtime_client(api_key=fb_key, base_url=fb_base_url):
+                return False
             self._fallback_activated = True
 
             # Re-evaluate prompt caching for the new provider/model
@@ -2592,6 +2817,22 @@ class AIAgent:
                             old_text=args.get("old_text"),
                             store=self._memory_store,
                         )
+                        if self._memory_graph:
+                            try:
+                                parsed = json.loads(result)
+                            except Exception:
+                                parsed = {}
+                            if parsed.get("success") and args.get("action") in {"add", "replace"}:
+                                graph_content = args.get("content") or ""
+                                if graph_content.strip():
+                                    self._memory_graph.ingest_memory_entry(
+                                        target=flush_target,
+                                        action=args.get("action", "add"),
+                                        content=graph_content,
+                                        old_text=args.get("old_text"),
+                                        session_id=self.session_id,
+                                        source_ref="flush_memories",
+                                    )
                         if self._honcho and flush_target == "user" and args.get("action") == "add":
                             self._honcho_save_user_observation(args.get("content", ""))
                         if not self.quiet_mode:
@@ -2610,6 +2851,58 @@ class AIAgent:
             if messages and messages[-1].get("_flush_sentinel") == _sentinel:
                 messages.pop()
 
+    def run_memory_maintenance(self, *, stale_days: int = 30, prune_max: int = 25) -> Optional[Dict[str, Any]]:
+        if not self._memory_graph:
+            return None
+        try:
+            return self._memory_graph.run_maintenance(
+                session_id=self.session_id,
+                stale_days=stale_days,
+                prune_max=prune_max,
+            )
+        except Exception as exc:
+            logger.debug("Memory graph maintenance failed: %s", exc)
+            return None
+
+    def run_dream_cycle(self, *, focus: str = "", max_hypotheses: int = 3) -> Optional[Dict[str, Any]]:
+        if not self._memory_graph:
+            return None
+        try:
+            runner = DreamCycle(self._memory_graph, session_id=self.session_id)
+            return runner.run_once(focus=focus, max_hypotheses=max_hypotheses)
+        except Exception as exc:
+            logger.debug("Dream cycle failed: %s", exc)
+            return None
+
+    def _is_non_destructive_tool_call(self, tool_name: str, tool_args: Dict[str, Any]) -> bool:
+        safe_tools = {
+            "read_file",
+            "search_files",
+            "session_search",
+            "browser_snapshot",
+            "browser_get_images",
+            "browser_vision",
+            "web_search",
+            "web_extract",
+            "web_crawl",
+            "todo",
+            "clarify",
+        }
+        if tool_name in safe_tools:
+            return True
+        if tool_name != "terminal":
+            return False
+        command = str((tool_args or {}).get("command") or "").strip()
+        if not command:
+            return False
+        if re.search(r"[><]|&&|\|\||\b(rm|mv|cp|chmod|chown|mkdir|rmdir|touch|tee|sed\s+-i|git\s+(add|commit|reset|checkout)|python\s+-c)\b", command):
+            return False
+        safe_prefixes = (
+            "ls", "pwd", "cat", "head", "tail", "rg", "grep", "find", "stat", "file",
+            "sqlite3", "git status", "git diff", "git log", "git show", "git grep", "echo",
+        )
+        return command.startswith(safe_prefixes)
+
     def _compress_context(self, messages: list, system_message: str, *, approx_tokens: int = None) -> tuple:
         """Compress conversation context and split the session in SQLite.
 
@@ -2620,6 +2913,21 @@ class AIAgent:
         self.flush_memories(messages, min_turns=0)
 
         compressed = self.context_compressor.compress(messages, current_tokens=approx_tokens)
+        if self._memory_graph:
+            try:
+                summary_bits = [
+                    msg.get("content", "")
+                    for msg in compressed
+                    if msg.get("role") in {"user", "assistant"} and isinstance(msg.get("content"), str)
+                ]
+                summary_text = "\n".join(bit.strip() for bit in summary_bits[-6:] if bit and bit.strip())
+                if summary_text:
+                    self._memory_graph.archive_session_summary(
+                        session_id=self.session_id,
+                        summary_text=summary_text[:4000],
+                    )
+            except Exception as mg_exc:
+                logger.debug("Memory graph compression archive failed: %s", mg_exc)
 
         todo_snapshot = self._todo_store.format_for_injection()
         if todo_snapshot:
@@ -2703,6 +3011,18 @@ class AIAgent:
                     logging.debug(f"Tool progress callback error: {cb_err}")
 
             tool_start_time = time.time()
+            memory_step_ctx = None
+            if self._memory_graph:
+                try:
+                    memory_step_ctx = self._memory_graph.begin_tool_step(
+                        session_id=self.session_id,
+                        task_id=effective_task_id,
+                        tool_name=function_name,
+                        tool_call_id=tool_call.id,
+                        arguments=function_args,
+                    )
+                except Exception as mg_exc:
+                    logger.debug("Memory graph tool-step creation failed: %s", mg_exc)
 
             if function_name == "todo":
                 from tools.todo_tool import todo_tool as _todo_tool
@@ -2742,6 +3062,31 @@ class AIAgent:
                 # Also send user observations to Honcho when active
                 if self._honcho and target == "user" and function_args.get("action") == "add":
                     self._honcho_save_user_observation(function_args.get("content", ""))
+                if self._memory_graph:
+                    try:
+                        parsed_result = json.loads(function_result)
+                    except Exception:
+                        parsed_result = {}
+                    if parsed_result.get("success") and function_args.get("action") in {"add", "replace"}:
+                        graph_content = function_args.get("content") or ""
+                        if graph_content.strip():
+                            self._memory_graph.ingest_memory_entry(
+                                target=target,
+                                action=function_args.get("action", "add"),
+                                content=graph_content,
+                                old_text=function_args.get("old_text"),
+                                session_id=self.session_id,
+                                task_id=effective_task_id,
+                                source_ref="memory_tool",
+                            )
+                    if parsed_result.get("success"):
+                        self._memory_graph.record_event(
+                            event_type="status_update",
+                            session_id=self.session_id,
+                            task_id=effective_task_id,
+                            reason=f"memory_tool:{function_args.get('action', '')}",
+                            payload={"target": target},
+                        )
                 tool_duration = time.time() - tool_start_time
                 if self.quiet_mode:
                     print(f"  {_get_cute_tool_message_impl('memory', function_args, tool_duration, result=function_result)}")
@@ -2855,6 +3200,32 @@ class AIAgent:
                     + f"\n\n[Truncated: tool response was {original_len:,} chars, "
                     f"exceeding the {MAX_TOOL_RESULT_CHARS:,} char limit]"
                 )
+
+            if self._memory_graph and memory_step_ctx:
+                try:
+                    outcome = self._memory_graph.record_tool_outcome(
+                        session_id=self.session_id,
+                        task_id=effective_task_id,
+                        step_id=memory_step_ctx["step_id"],
+                        goal_id=memory_step_ctx.get("goal_id"),
+                        task_root_id=memory_step_ctx.get("task_root_id"),
+                        tool_name=function_name,
+                        tool_call_id=tool_call.id,
+                        arguments=function_args,
+                        result_text=function_result,
+                        success=not _is_error_result,
+                        duration_seconds=tool_duration,
+                    )
+                    self._memory_graph.evaluate_hypotheses_from_tool(
+                        session_id=self.session_id,
+                        task_id=effective_task_id,
+                        tool_name=function_name,
+                        result_text=function_result,
+                        artifact_id=(outcome or {}).get("node_id"),
+                        safe_test=self._is_non_destructive_tool_call(function_name, function_args),
+                    )
+                except Exception as mg_exc:
+                    logger.debug("Memory graph tool outcome failed: %s", mg_exc)
 
             tool_msg = {
                 "role": "tool",
@@ -3109,6 +3480,15 @@ class AIAgent:
         user_msg = {"role": "user", "content": user_message}
         messages.append(user_msg)
         self._log_msg_to_db(user_msg)
+        if self._memory_graph:
+            try:
+                self._memory_graph.ensure_task_context(
+                    session_id=self.session_id,
+                    task_id=effective_task_id,
+                    user_message=original_user_message,
+                )
+            except Exception as mg_exc:
+                logger.debug("Memory graph task context init failed: %s", mg_exc)
         
         if not self.quiet_mode:
             print(f"💬 Starting conversation: '{user_message[:60]}{'...' if len(user_message) > 60 else ''}'")
@@ -3205,7 +3585,8 @@ class AIAgent:
         api_call_count = 0
         final_response = None
         interrupted = False
-        codex_ack_continuations = 0
+        ack_continuations = 0
+        post_tool_stub_continuations = 0
         
         # Clear any stale interrupt state at start
         self.clear_interrupt()
@@ -3284,6 +3665,12 @@ class AIAgent:
             effective_system = active_system_prompt or ""
             if self.ephemeral_system_prompt:
                 effective_system = (effective_system + "\n\n" + self.ephemeral_system_prompt).strip()
+            working_memory_prompt = self._build_subconscious_memory_prompt(
+                query=original_user_message or user_message,
+                task_id=effective_task_id,
+            )
+            if working_memory_prompt:
+                effective_system = (effective_system + "\n\n" + working_memory_prompt).strip()
             if effective_system:
                 api_messages = [{"role": "system", "content": effective_system}] + api_messages
             
@@ -4182,16 +4569,16 @@ class AIAgent:
                         self._empty_content_retries = 0
 
                     if (
-                        self.api_mode == "codex_responses"
-                        and self.valid_tool_names
-                        and codex_ack_continuations < 2
-                        and self._looks_like_codex_intermediate_ack(
+                        self.valid_tool_names
+                        and ack_continuations < self._ack_continuation_limit()
+                        and self._supports_ack_continuations()
+                        and self._looks_like_intermediate_ack(
                             user_message=user_message,
                             assistant_content=final_response,
                             messages=messages,
                         )
                     ):
-                        codex_ack_continuations += 1
+                        ack_continuations += 1
                         interim_msg = self._build_assistant_message(assistant_message, "incomplete")
                         messages.append(interim_msg)
                         self._log_msg_to_db(interim_msg)
@@ -4209,7 +4596,37 @@ class AIAgent:
                         self._save_session_log(messages)
                         continue
 
-                    codex_ack_continuations = 0
+                    ack_continuations = 0
+
+                    if (
+                        self._supports_ack_continuations()
+                        and post_tool_stub_continuations < 1
+                        and self._looks_like_post_tool_stub(
+                            user_message=user_message,
+                            assistant_content=final_response,
+                            messages=messages,
+                        )
+                    ):
+                        post_tool_stub_continuations += 1
+                        interim_msg = self._build_assistant_message(assistant_message, "incomplete")
+                        messages.append(interim_msg)
+                        self._log_msg_to_db(interim_msg)
+
+                        continue_msg = {
+                            "role": "user",
+                            "content": (
+                                "[System: You completed tool work, but you have not yet given the "
+                                "user the actual final answer. Summarize the results directly for "
+                                "the user now. Only call more tools if strictly necessary.]"
+                            ),
+                        }
+                        messages.append(continue_msg)
+                        self._log_msg_to_db(continue_msg)
+                        self._session_messages = messages
+                        self._save_session_log(messages)
+                        continue
+
+                    post_tool_stub_continuations = 0
                     
                     # Strip <think> blocks from user-facing response (keep raw in messages for trajectory)
                     final_response = self._strip_think_blocks(final_response).strip()

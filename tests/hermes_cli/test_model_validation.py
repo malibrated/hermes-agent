@@ -47,6 +47,11 @@ class TestParseModelInput:
         assert provider == "zai"
         assert model == "glm-5"
 
+    def test_local_alias_resolved(self):
+        provider, model = parse_model_input("local:qwen2.5-coder", "openrouter")
+        assert provider == "custom"
+        assert model == "qwen2.5-coder"
+
     def test_no_slash_no_colon_keeps_provider(self):
         provider, model = parse_model_input("gpt-5.4", "openrouter")
         assert provider == "openrouter"
@@ -106,6 +111,7 @@ class TestNormalizeProvider:
         assert normalize_provider("glm") == "zai"
         assert normalize_provider("kimi") == "kimi-coding"
         assert normalize_provider("moonshot") == "kimi-coding"
+        assert normalize_provider("local") == "custom"
 
     def test_case_insensitive(self):
         assert normalize_provider("OpenRouter") == "openrouter"

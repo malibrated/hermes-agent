@@ -69,6 +69,14 @@ class TestVerboseAndToolProgress:
         assert isinstance(cli.tool_progress_mode, str)
         assert cli.tool_progress_mode in ("off", "new", "all", "verbose")
 
+    def test_dreamcycle_idle_fields_initialized_before_agent(self):
+        cli = _make_cli()
+        assert isinstance(cli._dream_idle_enabled, bool)
+        assert isinstance(cli._dream_idle_seconds, int)
+        assert isinstance(cli._dream_idle_cadence, int)
+        assert isinstance(cli._last_activity_monotonic, float)
+        assert cli._last_dream_monotonic == 0.0
+
 
 class TestHistoryDisplay:
     def test_history_numbers_only_visible_messages_and_summarizes_tools(self, capsys):

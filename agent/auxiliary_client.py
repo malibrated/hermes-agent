@@ -39,6 +39,12 @@ from typing import Any, Dict, List, Optional, Tuple
 from openai import OpenAI
 
 from hermes_constants import OPENROUTER_BASE_URL
+from agent.local_mlx import (
+    DEFAULT_LOCAL_MLX_AUX_MODEL,
+    build_async_local_mlx_client,
+    build_local_mlx_client,
+    local_mlx_configured,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -445,6 +451,14 @@ def _try_custom_endpoint() -> Tuple[Optional[OpenAI], Optional[str]]:
     return OpenAI(api_key=custom_key, base_url=custom_base), model
 
 
+def _try_mlx() -> Tuple[Optional[Any], Optional[str]]:
+    if not local_mlx_configured():
+        return None, None
+    model = os.getenv("LOCAL_MLX_AUX_MODEL") or DEFAULT_LOCAL_MLX_AUX_MODEL
+    logger.debug("Auxiliary client: direct MLX (%s)", model)
+    return build_local_mlx_client(model_name=model), model
+
+
 def _try_codex() -> Tuple[Optional[Any], Optional[str]]:
     codex_token = _read_codex_access_token()
     if not codex_token:
@@ -474,9 +488,15 @@ def _resolve_forced_provider(forced: str) -> Tuple[Optional[OpenAI], Optional[st
             logger.warning("auxiliary.provider=codex but no Codex OAuth token found (run: hermes model)")
         return client, model
 
+    if forced == "mlx":
+        client, model = _try_mlx()
+        if client is None:
+            logger.warning("auxiliary.provider=mlx but LOCAL_MLX_MODEL is not configured")
+        return client, model
+
     if forced == "main":
         # "main" = skip OpenRouter/Nous, use the main chat model's credentials.
-        for try_fn in (_try_custom_endpoint, _try_codex, _resolve_api_key_provider):
+        for try_fn in (_try_mlx, _try_custom_endpoint, _try_codex, _resolve_api_key_provider):
             client, model = try_fn()
             if client is not None:
                 return client, model
@@ -490,7 +510,7 @@ def _resolve_forced_provider(forced: str) -> Tuple[Optional[OpenAI], Optional[st
 
 def _resolve_auto() -> Tuple[Optional[OpenAI], Optional[str]]:
     """Full auto-detection chain: OpenRouter → Nous → custom → Codex → API-key → None."""
-    for try_fn in (_try_openrouter, _try_nous, _try_custom_endpoint,
+    for try_fn in (_try_openrouter, _try_nous, _try_mlx, _try_custom_endpoint,
                    _try_codex, _resolve_api_key_provider):
         client, model = try_fn()
         if client is not None:
@@ -532,6 +552,8 @@ def get_async_text_auxiliary_client(task: str = ""):
 
     if isinstance(sync_client, CodexAuxiliaryClient):
         return AsyncCodexAuxiliaryClient(sync_client), model
+    if getattr(sync_client, "base_url", "") == "mlx://local":
+        return build_async_local_mlx_client(model_name=model), model
 
     async_kwargs = {
         "api_key": sync_client.api_key,
