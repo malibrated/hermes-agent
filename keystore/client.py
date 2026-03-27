@@ -115,8 +115,8 @@ class KeystoreClient:
         Unlock priority:
         1. Already unlocked → no-op
         2. OS credential store (if ``hermes keystore remember`` was used)
-        3. ``HERMES_KEYSTORE_PASSPHRASE`` env var
-        4. Interactive passphrase prompt (if ``interactive=True``)
+        3. Interactive passphrase prompt (if ``interactive=True``)
+        4. ``HERMES_KEYSTORE_PASSPHRASE`` env var (headless/Docker fallback only)
 
         Returns True if unlocked, False if not initialized (caller should
         set up the keystore), raises PassphraseMismatch on wrong passphrase.
@@ -144,40 +144,43 @@ class KeystoreClient:
                     credential_store.backend_name(),
                 )
 
-        # 2. Try env var
+        # 2. Interactive prompt (preferred over env var when TTY is available)
+        if interactive:
+            max_attempts = 3
+            for attempt in range(max_attempts):
+                try:
+                    passphrase = getpass.getpass("🔐 Keystore passphrase: ")
+                    if not passphrase:
+                        continue
+                    self._store.unlock(passphrase)
+                    return True
+                except PassphraseMismatch:
+                    remaining = max_attempts - attempt - 1
+                    if remaining > 0:
+                        print(f"  ✗ Incorrect passphrase ({remaining} attempts remaining)")
+                    else:
+                        print("  ✗ Incorrect passphrase")
+
+            raise PassphraseMismatch("Too many incorrect passphrase attempts")
+
+        # 3. Env var — last resort for headless/Docker/systemd deployments
+        # where no TTY or credential store is available. The passphrase is
+        # visible in the process environment, so this is a conscious security
+        # tradeoff for unattended operation.
         env_passphrase = os.getenv("HERMES_KEYSTORE_PASSPHRASE")
         if env_passphrase:
             try:
                 self._store.unlock(env_passphrase)
-                logger.debug("Unlocked via HERMES_KEYSTORE_PASSPHRASE env var")
+                logger.debug("Unlocked via HERMES_KEYSTORE_PASSPHRASE env var (headless fallback)")
                 return True
             except PassphraseMismatch:
                 logger.warning("HERMES_KEYSTORE_PASSPHRASE env var has wrong passphrase")
 
-        # 3. Interactive prompt
-        if not interactive:
-            raise KeystoreLocked(
-                "Keystore is locked and no automatic unlock method succeeded. "
-                "Set HERMES_KEYSTORE_PASSPHRASE env var, or run "
-                "'hermes keystore remember' to cache the passphrase."
-            )
-
-        max_attempts = 3
-        for attempt in range(max_attempts):
-            try:
-                passphrase = getpass.getpass("🔐 Keystore passphrase: ")
-                if not passphrase:
-                    continue
-                self._store.unlock(passphrase)
-                return True
-            except PassphraseMismatch:
-                remaining = max_attempts - attempt - 1
-                if remaining > 0:
-                    print(f"  ✗ Incorrect passphrase ({remaining} attempts remaining)")
-                else:
-                    print("  ✗ Incorrect passphrase")
-
-        raise PassphraseMismatch("Too many incorrect passphrase attempts")
+        raise KeystoreLocked(
+            "Keystore is locked and no automatic unlock method succeeded. "
+            "Run 'hermes keystore remember' to cache the passphrase, or "
+            "set HERMES_KEYSTORE_PASSPHRASE env var for headless deployments."
+        )
 
     def inject_env(self, force: bool = False, external_managed_names: Optional[set[str]] = None) -> Dict[str, bool]:
         """Inject all ``injectable`` secrets into ``os.environ``.

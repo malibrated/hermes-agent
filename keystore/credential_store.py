@@ -18,9 +18,9 @@ Security note:
   boundary around sealed secrets. If no real OS/keyctl-backed credential
   store exists, users must either:
 
-    - type the keystore passphrase at startup, or
-    - provide HERMES_KEYSTORE_PASSPHRASE explicitly for headless/systemd
-      deployments, accepting that tradeoff consciously.
+    - type the keystore passphrase at startup (recommended), or
+    - set HERMES_KEYSTORE_PASSPHRASE env var for headless/Docker/systemd
+      deployments (conscious security tradeoff for unattended operation)
 """
 
 import hashlib

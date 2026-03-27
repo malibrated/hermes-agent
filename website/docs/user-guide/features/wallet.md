@@ -36,9 +36,17 @@ You'll be prompted to create a passphrase. This is needed each time Hermes start
 # Save to your OS credential store (macOS Keychain, Windows Credential Locker,
 # GNOME/KDE Secret Service, or Linux keyctl when available)
 hermes keystore remember
+```
 
-# Or set an env var (for Docker / systemd / headless)
+For **headless/Docker/systemd** deployments where no credential store or TTY is available,
+you can set `HERMES_KEYSTORE_PASSPHRASE` as an environment variable. This is a conscious
+security tradeoff — the passphrase is visible in the process environment — and should only
+be used for unattended deployments:
+
+```bash
+# Headless/Docker/systemd only — not recommended for interactive use
 export HERMES_KEYSTORE_PASSPHRASE="your-passphrase"
+```
 
 Hermes intentionally does **not** fall back to a machine-derived encrypted file
 for remembered passphrases. In the current same-user execution model, that would
