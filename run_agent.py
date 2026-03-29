@@ -1043,7 +1043,20 @@ class AIAgent:
                     self._memory_store.load_from_disk()
             except Exception:
                 pass  # Memory is optional -- don't break agent init
-        
+
+        # Memory provider manager — orchestrates built-in + plugin providers.
+        # Existing Honcho code stays as-is (will migrate in a follow-up PR).
+        # The manager provides the extension point for plugin memory backends.
+        from agent.memory_manager import MemoryManager
+        from agent.builtin_memory_provider import BuiltinMemoryProvider
+        self._memory_manager = MemoryManager()
+        self._memory_manager.add_provider(BuiltinMemoryProvider(
+            memory_store=self._memory_store,
+            memory_enabled=self._memory_enabled,
+            user_profile_enabled=self._user_profile_enabled,
+        ))
+        # Plugin memory providers are added after Honcho init (below).
+
         # Honcho AI-native memory (cross-session user modeling)
         # Reads $HERMES_HOME/honcho.json (instance) or ~/.honcho/config.json (global).
         self._honcho = None  # HonchoSessionManager | None
@@ -1113,6 +1126,28 @@ class AIAgent:
             if _user_mode == "honcho":
                 self._user_profile_enabled = False
                 logger.debug("peer %s memory_mode=honcho: local USER.md writes disabled", _hcfg.peer_name or "user")
+
+        # Register plugin memory providers with the manager.
+        # Plugins call ctx.register_memory_provider() during discover_and_load().
+        if not skip_memory:
+            try:
+                from hermes_cli.plugins import get_plugin_memory_providers
+                for plugin_provider in get_plugin_memory_providers():
+                    try:
+                        if plugin_provider.is_available():
+                            self._memory_manager.add_provider(plugin_provider)
+                            plugin_provider.initialize(
+                                session_id=self.session_id or "",
+                                platform=self.platform,
+                                model=self.model,
+                            )
+                    except Exception as e:
+                        logger.warning(
+                            "Plugin memory provider '%s' init failed: %s",
+                            getattr(plugin_provider, "name", "unknown"), e,
+                        )
+            except Exception as e:
+                logger.debug("Plugin memory provider loading skipped: %s", e)
 
         # Skills config: nudge interval for skill creation reminders
         self._skill_nudge_interval = 10
@@ -2658,6 +2693,19 @@ class AIAgent:
                 user_block = self._memory_store.format_for_system_prompt("user")
                 if user_block:
                     prompt_parts.append(user_block)
+
+        # Plugin memory providers contribute system prompt blocks.
+        # (Builtin provider's block is already handled above via _memory_store.)
+        if hasattr(self, "_memory_manager"):
+            for provider in self._memory_manager.providers:
+                if provider.name == "builtin":
+                    continue  # already handled above
+                try:
+                    block = provider.system_prompt_block()
+                    if block and block.strip():
+                        prompt_parts.append(block)
+                except Exception as e:
+                    logger.debug("Memory provider '%s' prompt block failed: %s", provider.name, e)
 
         has_skills_tools = any(name in self.valid_tool_names for name in ['skills_list', 'skill_view', 'skill_manage'])
         if has_skills_tools:
@@ -6099,6 +6147,23 @@ class AIAgent:
             except Exception as e:
                 logger.debug("Honcho prefetch failed (non-fatal): %s", e)
 
+        # Plugin memory provider prefetch (non-builtin providers only).
+        self._plugin_memory_context = ""
+        self._plugin_memory_turn_context = ""
+        if hasattr(self, "_memory_manager"):
+            for provider in self._memory_manager.providers:
+                if provider.name == "builtin":
+                    continue
+                try:
+                    ctx = provider.prefetch(original_user_message)
+                    if ctx and ctx.strip():
+                        if not conversation_history:
+                            self._plugin_memory_context += ("\n\n" + ctx if self._plugin_memory_context else ctx)
+                        else:
+                            self._plugin_memory_turn_context += ("\n\n" + ctx if self._plugin_memory_turn_context else ctx)
+                except Exception as e:
+                    logger.debug("Memory provider '%s' prefetch failed: %s", provider.name, e)
+
         # Add user message
         user_msg = {"role": "user", "content": user_message}
         messages.append(user_msg)
@@ -6141,6 +6206,11 @@ class AIAgent:
                 if self._honcho_context:
                     self._cached_system_prompt = (
                         self._cached_system_prompt + "\n\n" + self._honcho_context
+                    ).strip()
+                # Plugin memory provider context (first turn → bake into system prompt)
+                if self._plugin_memory_context:
+                    self._cached_system_prompt = (
+                        self._cached_system_prompt + "\n\n" + self._plugin_memory_context
                     ).strip()
 
                 # Plugin hook: on_session_start
@@ -6310,6 +6380,15 @@ class AIAgent:
                 if idx == current_turn_user_idx and msg.get("role") == "user" and self._honcho_turn_context:
                     api_msg["content"] = _inject_honcho_turn_context(
                         api_msg.get("content", ""), self._honcho_turn_context
+                    )
+
+                # Plugin memory provider turn context injection
+                if idx == current_turn_user_idx and msg.get("role") == "user" and self._plugin_memory_turn_context:
+                    existing = api_msg.get("content", "")
+                    api_msg["content"] = (
+                        existing
+                        + "\n\n[Plugin memory context — relevant memories for this turn.]\n\n"
+                        + self._plugin_memory_turn_context
                     )
 
                 # For ALL assistant messages, pass reasoning back to the API
@@ -7948,6 +8027,17 @@ class AIAgent:
         if final_response and not interrupted and sync_honcho:
             self._honcho_sync(original_user_message, final_response)
             self._queue_honcho_prefetch(original_user_message)
+
+        # Sync to plugin memory providers and queue prefetch for next turn
+        if final_response and not interrupted and hasattr(self, "_memory_manager"):
+            for provider in self._memory_manager.providers:
+                if provider.name == "builtin":
+                    continue
+                try:
+                    provider.sync_turn(original_user_message, final_response)
+                    provider.queue_prefetch(original_user_message)
+                except Exception as e:
+                    logger.debug("Memory provider '%s' post-turn failed: %s", provider.name, e)
 
         # Plugin hook: post_llm_call
         # Fired once per turn after the tool-calling loop completes.
