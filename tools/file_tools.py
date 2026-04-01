@@ -213,6 +213,7 @@ def _get_file_ops(task_id: str = "default") -> ShellFileOperations:
                 image = ""
 
             cwd = overrides.get("cwd") or config["cwd"]
+            add_python = overrides.get("add_python")
             logger.info("Creating new %s environment for task %s...", env_type, task_id[:8])
 
             container_config = None
@@ -251,6 +252,7 @@ def _get_file_ops(task_id: str = "default") -> ShellFileOperations:
                 local_config=local_config,
                 task_id=task_id,
                 host_cwd=config.get("host_cwd"),
+                add_python=add_python,
             )
 
             with _env_lock:

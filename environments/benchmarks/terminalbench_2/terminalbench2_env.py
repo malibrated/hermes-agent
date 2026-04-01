@@ -298,6 +298,16 @@ class TerminalBench2EvalEnv(HermesAgentBaseEnv):
         for i, task in enumerate(self.all_eval_items):
             self.category_index[task.get("category", "unknown")].append(i)
 
+        # Pre-compute which tasks need Modal's add_python (avoids re-decoding
+        # multi-MB environment_tar blobs during per-task rollouts).
+        self._needs_add_python: Dict[str, bool] = {
+            task["task_name"]: self._image_needs_add_python(task)
+            for task in self.all_eval_items
+        }
+        add_py_count = sum(self._needs_add_python.values())
+        if add_py_count:
+            print(f"  {add_py_count} tasks need add_python (non-python base image)")
+
         # Reward tracking for wandb logging
         self.eval_metrics: List[Tuple[str, float]] = []
 
@@ -357,6 +367,36 @@ class TerminalBench2EvalEnv(HermesAgentBaseEnv):
     # =========================================================================
     # Docker image resolution
     # =========================================================================
+
+    @staticmethod
+    def _image_needs_add_python(item: Dict[str, Any]) -> bool:
+        """Check if the task's base image lacks `python` on PATH.
+
+        Parses the Dockerfile FROM line in environment_tar. Returns True
+        for non-python base images (ubuntu, debian, etc.) that need
+        Modal's add_python parameter.
+        """
+        environment_tar = item.get("environment_tar", "")
+        if not environment_tar:
+            return False
+        try:
+            raw = base64.b64decode(environment_tar)
+            buf = io.BytesIO(raw)
+            with tarfile.open(fileobj=buf, mode="r:gz") as tar:
+                for member in tar:
+                    if not member.isfile() or "Dockerfile" not in member.name:
+                        continue
+                    f = tar.extractfile(member)
+                    if not f:
+                        continue
+                    for line in f.read().decode("utf-8", errors="ignore").splitlines():
+                        stripped = line.strip()
+                        if stripped.upper().startswith("FROM "):
+                            base = stripped.split()[1].lower()
+                            return not base.startswith("python:")
+        except Exception:
+            pass
+        return False
 
     def _resolve_task_image(
         self, item: Dict[str, Any], task_name: str
@@ -449,11 +489,14 @@ class TerminalBench2EvalEnv(HermesAgentBaseEnv):
             # --- 2. Register per-task image override ---
             # Set both modal_image and docker_image so the task image is used
             # regardless of which backend is configured.
-            register_task_env_overrides(task_id, {
+            overrides = {
                 "modal_image": modal_image,
                 "docker_image": modal_image,
                 "cwd": "/app",
-            })
+            }
+            if self._needs_add_python.get(task_name, False):
+                overrides["add_python"] = "3.12"
+            register_task_env_overrides(task_id, overrides)
             logger.info(
                 "Task %s: registered image override for task_id %s",
                 task_name, task_id[:8],

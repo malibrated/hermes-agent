@@ -98,6 +98,7 @@ class ModalEnvironment(BaseEnvironment):
         modal_sandbox_kwargs: Optional[Dict[str, Any]] = None,
         persistent_filesystem: bool = True,
         task_id: str = "default",
+        add_python: Optional[str] = None,
     ):
         super().__init__(cwd=cwd, timeout=timeout)
 
@@ -125,16 +126,21 @@ class ModalEnvironment(BaseEnvironment):
 
         effective_image = restored_image if restored_image else image
 
-        # Pre-build a modal.Image with pip fix for Modal's legacy image builder.
-        # Some task images have broken pip; fix via ensurepip before Modal uses it.
+        # Modal requires `python` + `pip` on PATH. Images based on python:*
+        # have these; ubuntu/debian images don't, so they need add_python.
+        # When add_python is not needed, fix broken pip via ensurepip.
         import modal as _modal
         if isinstance(effective_image, str):
-            effective_image = _modal.Image.from_registry(
-                effective_image,
-                setup_dockerfile_commands=[
+            registry_kwargs = {}
+            if add_python:
+                registry_kwargs["add_python"] = add_python
+            else:
+                registry_kwargs["setup_dockerfile_commands"] = [
                     "RUN rm -rf /usr/local/lib/python*/site-packages/pip* 2>/dev/null; "
                     "python -m ensurepip --upgrade --default-pip 2>/dev/null || true",
-                ],
+                ]
+            effective_image = _modal.Image.from_registry(
+                effective_image, **registry_kwargs,
             )
 
         # Mount credential files (OAuth tokens, etc.) declared by skills.

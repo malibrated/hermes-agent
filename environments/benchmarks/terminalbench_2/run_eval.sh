@@ -32,8 +32,8 @@ export PYTHONUNBUFFERED=1
 # These go to the log file; tqdm + [START]/[PASS]/[FAIL] go to terminal
 export LOGLEVEL=INFO
 
-python terminalbench2_env.py evaluate \
-  --config default.yaml \
+uv run python environments/benchmarks/terminalbench_2/terminalbench2_env.py evaluate \
+  --config environments/benchmarks/terminalbench_2/default.yaml \
   "$@" \
   2>&1 | tee "$LOG_FILE"
 
