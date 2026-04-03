@@ -20,7 +20,7 @@ the steps below.
 
 | Component | Value |
 |-----------|-------|
-| **Library** | `@slack/bolt` (Socket Mode) |
+| **Library** | `slack-bolt` / `slack_sdk` for Python (Socket Mode) |
 | **Connection** | WebSocket — no public URL required |
 | **Auth tokens needed** | Bot Token (`xoxb-`) + App-Level Token (`xapp-`) |
 | **User identification** | Slack Member IDs (e.g., `U01ABC2DEF3`) |
@@ -46,20 +46,26 @@ Navigate to **Features → OAuth & Permissions** in the sidebar. Scroll to **Sco
 | Scope | Purpose |
 |-------|---------|
 | `chat:write` | Send messages as the bot |
-| `app_mentions:read` | Respond when @mentioned in channels |
+| `app_mentions:read` | Detect when @mentioned in channels |
 | `channels:history` | Read messages in public channels the bot is in |
 | `channels:read` | List and get info about public channels |
+| `groups:history` | Read messages in private channels the bot is invited to |
 | `im:history` | Read direct message history |
 | `im:read` | View basic DM info |
 | `im:write` | Open and manage DMs |
 | `users:read` | Look up user information |
+| `files:write` | Upload files (images, audio, documents) |
+
+:::caution Missing scopes = missing features
+Without `channels:history` and `groups:history`, the bot **will not receive messages in channels** —
+it will only work in DMs. These are the most commonly missed scopes.
+:::
 
 **Optional scopes:**
 
 | Scope | Purpose |
 |-------|---------|
-| `groups:history` | Read messages in private channels the bot is invited to |
-| `files:write` | Upload files (audio, images) |
+| `groups:read` | List and get info about private channels |
 
 ---
 
@@ -83,26 +89,47 @@ You can always find or regenerate app-level tokens under **Settings → Basic In
 
 ## Step 4: Subscribe to Events
 
+This step is critical — it controls what messages the bot can see.
+
+
 1. In the sidebar, go to **Features → Event Subscriptions**
 2. Toggle **Enable Events** to ON
 3. Expand **Subscribe to bot events** and add:
 
-| Event | Purpose |
-|-------|---------|
-| `app_mention` | Bot responds when @mentioned in any channel |
-| `message.im` | Bot responds to direct messages |
-
-**Optional event:**
-
-| Event | Purpose |
-|-------|---------|
-| `message.channels` | Bot sees all messages in public channels it's added to |
+| Event | Required? | Purpose |
+|-------|-----------|---------|
+| `message.im` | **Yes** | Bot receives direct messages |
+| `message.channels` | **Yes** | Bot receives messages in **public** channels it's added to |
+| `message.groups` | **Recommended** | Bot receives messages in **private** channels it's invited to |
+| `app_mention` | **Yes** | Prevents Bolt SDK errors when bot is @mentioned |
 
 4. Click **Save Changes** at the bottom of the page
 
+:::danger Missing event subscriptions is the #1 setup issue
+If the bot works in DMs but **not in channels**, you almost certainly forgot to add
+`message.channels` (for public channels) and/or `message.groups` (for private channels).
+Without these events, Slack simply never delivers channel messages to the bot.
+:::
+
+
 ---
 
-## Step 5: Install App to Workspace
+## Step 5: Enable the Messages Tab
+
+This step enables direct messages to the bot. Without it, users see **"Sending messages to this app has been turned off"** when trying to DM the bot.
+
+1. In the sidebar, go to **Features → App Home**
+2. Scroll to **Show Tabs**
+3. Toggle **Messages Tab** to ON
+4. Check **"Allow users to send Slash commands and messages from the messages tab"**
+
+:::danger Without this step, DMs are completely blocked
+Even with all the correct scopes and event subscriptions, Slack will not allow users to send direct messages to the bot unless the Messages Tab is enabled. This is a Slack platform requirement, not a Hermes configuration issue.
+:::
+
+---
+
+## Step 6: Install App to Workspace
 
 1. In the sidebar, go to **Settings → Install App**
 2. Click **Install to Workspace**
@@ -111,13 +138,13 @@ You can always find or regenerate app-level tokens under **Settings → Basic In
 5. **Copy this token** — this is your `SLACK_BOT_TOKEN`
 
 :::tip
-If you change scopes later, you'll need to **reinstall the app** for the new scopes to take effect.
-The Install App page will show a banner prompting you to do so.
+If you change scopes or event subscriptions later, you **must reinstall the app** for the changes
+to take effect. The Install App page will show a banner prompting you to do so.
 :::
 
 ---
 
-## Step 6: Find User IDs for the Allowlist
+## Step 7: Find User IDs for the Allowlist
 
 Hermes uses Slack **Member IDs** (not usernames or display names) for the allowlist.
 
@@ -132,18 +159,19 @@ Member IDs look like `U01ABC2DEF3`. You need your own Member ID at minimum.
 
 ---
 
-## Step 7: Configure Hermes
+## Step 8: Configure Hermes
 
 Add the following to your `~/.hermes/.env` file:
 
 ```bash
 # Required
 SLACK_BOT_TOKEN=xoxb-your-bot-token-here
-SLACK_APP_TOKEN=xapp-your-app-level-token-here
+SLACK_APP_TOKEN=xapp-your-app-token-here
 SLACK_ALLOWED_USERS=U01ABC2DEF3              # Comma-separated Member IDs
 
 # Optional
 SLACK_HOME_CHANNEL=C01234567890              # Default channel for cron/scheduled messages
+SLACK_HOME_CHANNEL_NAME=general              # Human-readable name for the home channel (optional)
 ```
 
 Or run the interactive setup:
@@ -156,10 +184,159 @@ Then start the gateway:
 
 ```bash
 hermes gateway              # Foreground
-hermes gateway install      # Install as a system service
+hermes gateway install      # Install as a user service
+sudo hermes gateway install --system   # Linux only: boot-time system service
 ```
 
 ---
+
+## Step 9: Invite the Bot to Channels
+
+After starting the gateway, you need to **invite the bot** to any channel where you want it to respond:
+
+```
+/invite @Hermes Agent
+```
+
+The bot will **not** automatically join channels. You must invite it to each channel individually.
+
+---
+
+## How the Bot Responds
+
+Understanding how Hermes behaves in different contexts:
+
+| Context | Behavior |
+|---------|----------|
+| **DMs** | Bot responds to every message — no @mention needed |
+| **Channels** | Bot **only responds when @mentioned** (e.g., `@Hermes Agent what time is it?`). In channels, Hermes replies in a thread attached to that message. |
+| **Threads** | If you @mention Hermes inside an existing thread, it replies in that same thread. |
+
+:::tip
+In channels, always @mention the bot. Simply typing a message without mentioning it will be ignored.
+This is intentional — it prevents the bot from responding to every message in busy channels.
+:::
+
+---
+
+## Configuration Options
+
+Beyond the required environment variables from Step 8, you can customize Slack bot behavior through `~/.hermes/config.yaml`.
+
+### Thread & Reply Behavior
+
+```yaml
+platforms:
+  slack:
+    # Controls how multi-part responses are threaded
+    # "off"   — never thread replies to the original message
+    # "first" — first chunk threads to user's message (default)
+    # "all"   — all chunks thread to user's message
+    reply_to_mode: "first"
+
+    extra:
+      # Whether to reply in a thread (default: true).
+      # When false, channel messages get direct channel replies instead
+      # of threads. Messages inside existing threads still reply in-thread.
+      reply_in_thread: true
+
+      # Also post thread replies to the main channel
+      # (Slack's "Also send to channel" feature).
+      # Only the first chunk of the first reply is broadcast.
+      reply_broadcast: false
+```
+
+| Key | Default | Description |
+|-----|---------|-------------|
+| `platforms.slack.reply_to_mode` | `"first"` | Threading mode for multi-part messages: `"off"`, `"first"`, or `"all"` |
+| `platforms.slack.extra.reply_in_thread` | `true` | When `false`, channel messages get direct replies instead of threads. Messages inside existing threads still reply in-thread. |
+| `platforms.slack.extra.reply_broadcast` | `false` | When `true`, thread replies are also posted to the main channel. Only the first chunk is broadcast. |
+
+### Session Isolation
+
+```yaml
+# Global setting — applies to Slack and all other platforms
+group_sessions_per_user: true
+```
+
+When `true` (the default), each user in a shared channel gets their own isolated conversation session. Two people talking to Hermes in `#general` will have separate histories and contexts.
+
+Set to `false` if you want a collaborative mode where the entire channel shares one conversation session. Be aware this means users share context growth and token costs, and one user's `/reset` clears the session for everyone.
+
+### Mention & Trigger Behavior
+
+```yaml
+slack:
+  # Require @mention in channels (this is the default behavior;
+  # the Slack adapter enforces @mention gating in channels regardless,
+  # but you can set this explicitly for consistency with other platforms)
+  require_mention: true
+
+  # Custom mention patterns that trigger the bot
+  # (in addition to the default @mention detection)
+  mention_patterns:
+    - "hey hermes"
+    - "hermes,"
+
+  # Text prepended to every outgoing message
+  reply_prefix: ""
+```
+
+:::info
+Unlike Discord and Telegram, Slack does not have a `free_response_channels` equivalent. The Slack adapter always requires `@mention` in channels — this is hardcoded behavior. In DMs, the bot always responds without needing a mention.
+:::
+
+### Unauthorized User Handling
+
+```yaml
+slack:
+  # What happens when an unauthorized user (not in SLACK_ALLOWED_USERS) DMs the bot
+  # "pair"   — prompt them for a pairing code (default)
+  # "ignore" — silently drop the message
+  unauthorized_dm_behavior: "pair"
+```
+
+You can also set this globally for all platforms:
+
+```yaml
+unauthorized_dm_behavior: "pair"
+```
+
+The platform-specific setting under `slack:` takes precedence over the global setting.
+
+### Voice Transcription
+
+```yaml
+# Global setting — enable/disable automatic transcription of incoming voice messages
+stt_enabled: true
+```
+
+When `true` (the default), incoming audio messages are automatically transcribed using the configured STT provider before being processed by the agent.
+
+### Full Example
+
+```yaml
+# Global gateway settings
+group_sessions_per_user: true
+unauthorized_dm_behavior: "pair"
+stt_enabled: true
+
+# Slack-specific settings
+slack:
+  require_mention: true
+  unauthorized_dm_behavior: "pair"
+
+# Platform config
+platforms:
+  slack:
+    reply_to_mode: "first"
+    extra:
+      reply_in_thread: true
+      reply_broadcast: false
+```
+
+---
+
 
 ## Home Channel
 
@@ -178,11 +355,65 @@ Make sure the bot has been **invited to the channel** (`/invite @Hermes Agent`).
 
 ---
 
+## Multi-Workspace Support
+
+Hermes can connect to **multiple Slack workspaces** simultaneously using a single gateway instance. Each workspace is authenticated independently with its own bot user ID.
+
+### Configuration
+
+Provide multiple bot tokens as a **comma-separated list** in `SLACK_BOT_TOKEN`:
+
+```bash
+# Multiple bot tokens — one per workspace
+SLACK_BOT_TOKEN=xoxb-workspace1-token,xoxb-workspace2-token,xoxb-workspace3-token
+
+# A single app-level token is still used for Socket Mode
+SLACK_APP_TOKEN=xapp-your-app-token
+```
+
+Or in `~/.hermes/config.yaml`:
+
+```yaml
+platforms:
+  slack:
+    token: "xoxb-workspace1-token,xoxb-workspace2-token"
+```
+
+### OAuth Token File
+
+In addition to tokens in the environment or config, Hermes also loads tokens from an **OAuth token file** at:
+
+```
+~/.hermes/platforms/slack/slack_tokens.json
+```
+
+This file is a JSON object mapping team IDs to token entries:
+
+```json
+{
+  "T01ABC2DEF3": {
+    "token": "xoxb-workspace-token-here",
+    "team_name": "My Workspace"
+  }
+}
+```
+
+Tokens from this file are merged with any tokens specified via `SLACK_BOT_TOKEN`. Duplicate tokens are automatically deduplicated.
+
+### How it works
+
+- The **first token** in the list is the primary token, used for the Socket Mode connection (AsyncApp).
+- Each token is authenticated via `auth.test` on startup. The gateway maps each `team_id` to its own `WebClient` and `bot_user_id`.
+- When a message arrives, Hermes uses the correct workspace-specific client to respond.
+- The primary `bot_user_id` (from the first token) is used for backward compatibility with features that expect a single bot identity.
+
+---
+
 ## Voice Messages
 
 Hermes supports voice on Slack:
 
-- **Incoming:** Voice/audio messages are automatically transcribed using Whisper (requires `VOICE_TOOLS_OPENAI_KEY`)
+- **Incoming:** Voice/audio messages are automatically transcribed using the configured STT provider: local `faster-whisper`, Groq Whisper (`GROQ_API_KEY`), or OpenAI Whisper (`VOICE_TOOLS_OPENAI_KEY`)
 - **Outgoing:** TTS responses are sent as audio file attachments
 
 ---
@@ -192,11 +423,28 @@ Hermes supports voice on Slack:
 | Problem | Solution |
 |---------|----------|
 | Bot doesn't respond to DMs | Verify `message.im` is in your event subscriptions and the app is reinstalled |
-| Bot doesn't respond to @mentions | Verify `app_mention` is in your event subscriptions |
+| Bot works in DMs but not in channels | **Most common issue.** Add `message.channels` and `message.groups` to event subscriptions, reinstall the app, and invite the bot to the channel with `/invite @Hermes Agent` |
+| Bot doesn't respond to @mentions in channels | 1) Check `message.channels` event is subscribed. 2) Bot must be invited to the channel. 3) Ensure `channels:history` scope is added. 4) Reinstall the app after scope/event changes |
+| Bot ignores messages in private channels | Add both the `message.groups` event subscription and `groups:history` scope, then reinstall the app and `/invite` the bot |
+| "Sending messages to this app has been turned off" in DMs | Enable the **Messages Tab** in App Home settings (see Step 5) |
 | "not_authed" or "invalid_auth" errors | Regenerate your Bot Token and App Token, update `.env` |
 | Bot responds but can't post in a channel | Invite the bot to the channel with `/invite @Hermes Agent` |
 | "missing_scope" error | Add the required scope in OAuth & Permissions, then **reinstall** the app |
 | Socket disconnects frequently | Check your network; Bolt auto-reconnects but unstable connections cause lag |
+| Changed scopes/events but nothing changed | You **must reinstall** the app to your workspace after any scope or event subscription change |
+
+### Quick Checklist
+
+If the bot isn't working in channels, verify **all** of the following:
+
+1. ✅ `message.channels` event is subscribed (for public channels)
+2. ✅ `message.groups` event is subscribed (for private channels)
+3. ✅ `app_mention` event is subscribed
+4. ✅ `channels:history` scope is added (for public channels)
+5. ✅ `groups:history` scope is added (for private channels)
+6. ✅ App was **reinstalled** after adding scopes/events
+7. ✅ Bot was **invited** to the channel (`/invite @Hermes Agent`)
+8. ✅ You are **@mentioning** the bot in your message
 
 ---
 

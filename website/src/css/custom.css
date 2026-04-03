@@ -67,6 +67,14 @@
   border-bottom: 1px solid rgba(255, 215, 0, 0.08);
 }
 
+/* backdrop-filter creates a stacking context that hides
+   .navbar-sidebar menu content (Docusaurus #6996). Remove it
+   while the mobile sidebar is open — both classes live on the
+   same <nav> element. */
+.navbar.navbar-sidebar--show {
+  backdrop-filter: none;
+}
+
 .navbar__title {
   font-weight: 600;
   letter-spacing: -0.02em;
@@ -87,6 +95,56 @@
 [data-theme='dark'] .prism-code {
   background-color: #0a0a12 !important;
   border: 1px solid rgba(255, 215, 0, 0.06);
+}
+
+/* Text diagrams: preserve spacing, disable ligatures, and prefer box-drawing-safe fonts */
+pre.prism-code.language-text,
+pre.prism-code.language-plaintext,
+pre.prism-code.language-txt,
+pre.prism-code.language-ascii {
+  white-space: pre;
+  overflow-x: auto;
+  line-height: 1.35;
+  font-family: 'JetBrains Mono', 'Cascadia Mono', 'Cascadia Code', 'Fira Code', 'SFMono-Regular', 'DejaVu Sans Mono', 'Liberation Mono', monospace;
+  font-variant-ligatures: none;
+  font-feature-settings: "liga" 0, "calt" 0;
+  text-rendering: optimizeSpeed;
+}
+
+pre.prism-code.language-text code,
+pre.prism-code.language-plaintext code,
+pre.prism-code.language-txt code,
+pre.prism-code.language-ascii code {
+  white-space: pre;
+  font-variant-ligatures: none;
+  font-feature-settings: "liga" 0, "calt" 0;
+}
+
+.theme-mermaid {
+  margin: 1.5rem 0;
+  text-align: center;
+}
+
+.theme-mermaid svg {
+  max-width: 100%;
+  height: auto;
+}
+
+.docs-terminal-figure {
+  display: block;
+  width: 100%;
+  max-width: 900px;
+  margin: 1.25rem auto 0.5rem;
+  border: 1px solid rgba(255, 215, 0, 0.08);
+  border-radius: 12px;
+  background: #0a0a12;
+}
+
+.docs-figure-caption {
+  margin-top: 0.35rem;
+  text-align: center;
+  color: var(--ifm-font-color-secondary);
+  font-size: 0.95rem;
 }
 
 /* Admonitions — gold-tinted */
@@ -147,6 +205,46 @@
 [data-theme='dark'] .DocSearch-Button {
   background-color: #0f0f18;
   border: 1px solid rgba(255, 215, 0, 0.08);
+}
+
+/* ─── Mobile sidebar improvements ─────────────────────────────────────────── */
+
+/* Larger touch targets on mobile */
+@media (max-width: 996px) {
+  .menu__link {
+    padding: 0.6rem 0.75rem;
+    font-size: 0.95rem;
+  }
+
+  .menu__list-item-collapsible > .menu__link {
+    font-weight: 600;
+    font-size: 1rem;
+    padding: 0.75rem 0.75rem;
+    border-bottom: 1px solid rgba(255, 215, 0, 0.06);
+  }
+
+  /* Category caret — more visible */
+  .menu__caret::before {
+    background-size: 1.5rem 1.5rem;
+  }
+
+  /* Indent subcategories clearly */
+  .menu__list .menu__list {
+    padding-left: 0.75rem;
+    border-left: 1px solid rgba(255, 215, 0, 0.06);
+    margin-left: 0.5rem;
+  }
+
+  /* Sidebar overlay — slightly more opaque for readability */
+  .navbar-sidebar__backdrop {
+    background-color: rgba(0, 0, 0, 0.6);
+  }
+
+  /* Sidebar width on mobile — use more of the screen */
+  .navbar-sidebar {
+    width: 85vw;
+    max-width: 360px;
+  }
 }
 
 /* Hero banner for docs landing if needed */

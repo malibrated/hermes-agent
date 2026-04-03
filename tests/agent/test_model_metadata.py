@@ -22,6 +22,7 @@ from unittest.mock import patch, MagicMock
 from agent.model_metadata import (
     CONTEXT_PROBE_TIERS,
     DEFAULT_CONTEXT_LENGTHS,
+    _strip_provider_prefix,
     estimate_tokens_rough,
     estimate_messages_tokens_rough,
     get_model_context_length,
@@ -105,15 +106,26 @@ class TestEstimateMessagesTokensRough:
 # =========================================================================
 
 class TestDefaultContextLengths:
-    def test_claude_models_200k(self):
+    def test_claude_models_context_lengths(self):
         for key, value in DEFAULT_CONTEXT_LENGTHS.items():
-            if "claude" in key:
+            if "claude" not in key:
+                continue
+            # Claude 4.6 models have 1M context
+            if "4.6" in key or "4-6" in key:
+                assert value == 1000000, f"{key} should be 1000000"
+            else:
                 assert value == 200000, f"{key} should be 200000"
 
-    def test_gpt4_models_128k(self):
+    def test_gpt4_models_128k_or_1m(self):
+        # gpt-4.1 and gpt-4.1-mini have 1M context; other gpt-4* have 128k
         for key, value in DEFAULT_CONTEXT_LENGTHS.items():
-            if "gpt-4" in key:
+            if "gpt-4" in key and "gpt-4.1" not in key:
                 assert value == 128000, f"{key} should be 128000"
+
+    def test_gpt41_models_1m(self):
+        for key, value in DEFAULT_CONTEXT_LENGTHS.items():
+            if "gpt-4.1" in key:
+                assert value == 1047576, f"{key} should be 1047576"
 
     def test_gemini_models_1m(self):
         for key, value in DEFAULT_CONTEXT_LENGTHS.items():
@@ -181,6 +193,152 @@ class TestGetModelContextLength:
             # No base_url → cache skipped → falls to probe tier
             result = get_model_context_length("custom/model")
             assert result == CONTEXT_PROBE_TIERS[0]
+
+    @patch("agent.model_metadata.fetch_model_metadata")
+    @patch("agent.model_metadata.fetch_endpoint_model_metadata")
+    def test_custom_endpoint_metadata_beats_fuzzy_default(self, mock_endpoint_fetch, mock_fetch):
+        mock_fetch.return_value = {}
+        mock_endpoint_fetch.return_value = {
+            "zai-org/GLM-5-TEE": {"context_length": 65536}
+        }
+
+        result = get_model_context_length(
+            "zai-org/GLM-5-TEE",
+            base_url="https://llm.chutes.ai/v1",
+            api_key="test-key",
+        )
+
+        assert result == 65536
+
+    @patch("agent.model_metadata.fetch_model_metadata")
+    @patch("agent.model_metadata.fetch_endpoint_model_metadata")
+    def test_custom_endpoint_without_metadata_skips_name_based_default(self, mock_endpoint_fetch, mock_fetch):
+        mock_fetch.return_value = {}
+        mock_endpoint_fetch.return_value = {}
+
+        result = get_model_context_length(
+            "zai-org/GLM-5-TEE",
+            base_url="https://llm.chutes.ai/v1",
+            api_key="test-key",
+        )
+
+        assert result == CONTEXT_PROBE_TIERS[0]
+
+    @patch("agent.model_metadata.fetch_model_metadata")
+    @patch("agent.model_metadata.fetch_endpoint_model_metadata")
+    def test_custom_endpoint_single_model_fallback(self, mock_endpoint_fetch, mock_fetch):
+        """Single-model servers: use the only model even if name doesn't match."""
+        mock_fetch.return_value = {}
+        mock_endpoint_fetch.return_value = {
+            "Qwen3.5-9B-Q4_K_M.gguf": {"context_length": 131072}
+        }
+
+        result = get_model_context_length(
+            "qwen3.5:9b",
+            base_url="http://myserver.example.com:8080/v1",
+            api_key="test-key",
+        )
+
+        assert result == 131072
+
+    @patch("agent.model_metadata.fetch_model_metadata")
+    @patch("agent.model_metadata.fetch_endpoint_model_metadata")
+    def test_custom_endpoint_fuzzy_substring_match(self, mock_endpoint_fetch, mock_fetch):
+        """Fuzzy match: configured model name is substring of endpoint model."""
+        mock_fetch.return_value = {}
+        mock_endpoint_fetch.return_value = {
+            "org/llama-3.3-70b-instruct-fp8": {"context_length": 131072},
+            "org/qwen-2.5-72b": {"context_length": 32768},
+        }
+
+        result = get_model_context_length(
+            "llama-3.3-70b-instruct",
+            base_url="http://myserver.example.com:8080/v1",
+            api_key="test-key",
+        )
+
+        assert result == 131072
+
+    @patch("agent.model_metadata.fetch_model_metadata")
+    def test_config_context_length_overrides_all(self, mock_fetch):
+        """Explicit config_context_length takes priority over everything."""
+        mock_fetch.return_value = {
+            "test/model": {"context_length": 200000}
+        }
+
+        result = get_model_context_length(
+            "test/model",
+            config_context_length=65536,
+        )
+
+        assert result == 65536
+
+    @patch("agent.model_metadata.fetch_model_metadata")
+    def test_config_context_length_zero_is_ignored(self, mock_fetch):
+        """config_context_length=0 should be treated as unset."""
+        mock_fetch.return_value = {}
+
+        result = get_model_context_length(
+            "anthropic/claude-sonnet-4",
+            config_context_length=0,
+        )
+
+        assert result == 200000
+
+    @patch("agent.model_metadata.fetch_model_metadata")
+    def test_config_context_length_none_is_ignored(self, mock_fetch):
+        """config_context_length=None should be treated as unset."""
+        mock_fetch.return_value = {}
+
+        result = get_model_context_length(
+            "anthropic/claude-sonnet-4",
+            config_context_length=None,
+        )
+
+        assert result == 200000
+
+
+# =========================================================================
+# _strip_provider_prefix — Ollama model:tag vs provider:model
+# =========================================================================
+
+class TestStripProviderPrefix:
+    def test_known_provider_prefix_is_stripped(self):
+        assert _strip_provider_prefix("local:my-model") == "my-model"
+        assert _strip_provider_prefix("openrouter:anthropic/claude-sonnet-4") == "anthropic/claude-sonnet-4"
+        assert _strip_provider_prefix("anthropic:claude-sonnet-4") == "claude-sonnet-4"
+
+    def test_ollama_model_tag_preserved(self):
+        """Ollama model:tag format must NOT be stripped."""
+        assert _strip_provider_prefix("qwen3.5:27b") == "qwen3.5:27b"
+        assert _strip_provider_prefix("llama3.3:70b") == "llama3.3:70b"
+        assert _strip_provider_prefix("gemma2:9b") == "gemma2:9b"
+        assert _strip_provider_prefix("codellama:13b-instruct-q4_0") == "codellama:13b-instruct-q4_0"
+
+    def test_http_urls_preserved(self):
+        assert _strip_provider_prefix("http://example.com") == "http://example.com"
+        assert _strip_provider_prefix("https://example.com") == "https://example.com"
+
+    def test_no_colon_returns_unchanged(self):
+        assert _strip_provider_prefix("gpt-4o") == "gpt-4o"
+        assert _strip_provider_prefix("anthropic/claude-sonnet-4") == "anthropic/claude-sonnet-4"
+
+    @patch("agent.model_metadata.fetch_model_metadata")
+    def test_ollama_model_tag_not_mangled_in_context_lookup(self, mock_fetch):
+        """Ensure 'qwen3.5:27b' is NOT reduced to '27b' during context length lookup.
+
+        We mock a custom endpoint that knows 'qwen3.5:27b' — the full name
+        must reach the endpoint metadata lookup intact.
+        """
+        mock_fetch.return_value = {}
+        with patch("agent.model_metadata.fetch_endpoint_model_metadata") as mock_ep, \
+             patch("agent.model_metadata._is_custom_endpoint", return_value=True):
+            mock_ep.return_value = {"qwen3.5:27b": {"context_length": 32768}}
+            result = get_model_context_length(
+                "qwen3.5:27b",
+                base_url="http://localhost:11434/v1",
+            )
+        assert result == 32768
 
 
 # =========================================================================
@@ -253,6 +411,25 @@ class TestFetchModelMetadata:
         assert result["anthropic/claude-3.5-sonnet"]["context_length"] == 200000
 
     @patch("agent.model_metadata.requests.get")
+    def test_provider_prefixed_models_get_bare_aliases(self, mock_get):
+        self._reset_cache()
+        mock_response = MagicMock()
+        mock_response.json.return_value = {
+            "data": [{
+                "id": "provider/test-model",
+                "context_length": 123456,
+                "name": "Provider: Test Model",
+            }]
+        }
+        mock_response.raise_for_status = MagicMock()
+        mock_get.return_value = mock_response
+
+        result = fetch_model_metadata(force_refresh=True)
+
+        assert result["provider/test-model"]["context_length"] == 123456
+        assert result["test-model"]["context_length"] == 123456
+
+    @patch("agent.model_metadata.requests.get")
     def test_ttl_expiry_triggers_refetch(self, mock_get):
         """Cache expires after _MODEL_CACHE_TTL seconds."""
         import agent.model_metadata as mm
@@ -295,35 +472,35 @@ class TestContextProbeTiers:
         for i in range(len(CONTEXT_PROBE_TIERS) - 1):
             assert CONTEXT_PROBE_TIERS[i] > CONTEXT_PROBE_TIERS[i + 1]
 
-    def test_first_tier_is_2m(self):
-        assert CONTEXT_PROBE_TIERS[0] == 2_000_000
+    def test_first_tier_is_128k(self):
+        assert CONTEXT_PROBE_TIERS[0] == 128_000
 
-    def test_last_tier_is_32k(self):
-        assert CONTEXT_PROBE_TIERS[-1] == 32_000
+    def test_last_tier_is_8k(self):
+        assert CONTEXT_PROBE_TIERS[-1] == 8_000
 
 
 class TestGetNextProbeTier:
-    def test_from_2m(self):
-        assert get_next_probe_tier(2_000_000) == 1_000_000
-
-    def test_from_1m(self):
-        assert get_next_probe_tier(1_000_000) == 512_000
-
     def test_from_128k(self):
         assert get_next_probe_tier(128_000) == 64_000
 
-    def test_from_32k_returns_none(self):
-        assert get_next_probe_tier(32_000) is None
+    def test_from_64k(self):
+        assert get_next_probe_tier(64_000) == 32_000
+
+    def test_from_32k(self):
+        assert get_next_probe_tier(32_000) == 16_000
+
+    def test_from_8k_returns_none(self):
+        assert get_next_probe_tier(8_000) is None
 
     def test_from_below_min_returns_none(self):
-        assert get_next_probe_tier(16_000) is None
+        assert get_next_probe_tier(4_000) is None
 
     def test_from_arbitrary_value(self):
-        assert get_next_probe_tier(300_000) == 200_000
+        assert get_next_probe_tier(100_000) == 64_000
 
     def test_above_max_tier(self):
-        """Value above 2M should return 2M."""
-        assert get_next_probe_tier(5_000_000) == 2_000_000
+        """Value above 128K should return 128K."""
+        assert get_next_probe_tier(500_000) == 128_000
 
     def test_zero_returns_none(self):
         assert get_next_probe_tier(0) is None

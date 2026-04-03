@@ -1,10 +1,19 @@
 """Tests for agent.redact -- secret masking in logs and output."""
 
 import logging
+import os
 
 import pytest
 
 from agent.redact import redact_sensitive_text, RedactingFormatter
+
+
+@pytest.fixture(autouse=True)
+def _ensure_redaction_enabled(monkeypatch):
+    """Ensure HERMES_REDACT_SECRETS is not disabled by prior test imports."""
+    monkeypatch.delenv("HERMES_REDACT_SECRETS", raising=False)
+    # Also patch the module-level snapshot so it reflects the cleared env var
+    monkeypatch.setattr("agent.redact._REDACT_ENABLED", True)
 
 
 class TestKnownPrefixes:
@@ -124,6 +133,13 @@ class TestPassthrough:
     def test_none_returns_none(self):
         assert redact_sensitive_text(None) is None
 
+    def test_non_string_input_int_coerced(self):
+        assert redact_sensitive_text(12345) == "12345"
+
+    def test_non_string_input_dict_coerced_and_redacted(self):
+        result = redact_sensitive_text({"token": "sk-proj-abc123def456ghi789jkl012"})
+        assert "abc123def456" not in result
+
     def test_normal_text_unchanged(self):
         text = "Hello world, this is a normal log message with no secrets."
         assert redact_sensitive_text(text) == text
@@ -141,9 +157,13 @@ class TestRedactingFormatter:
     def test_formats_and_redacts(self):
         formatter = RedactingFormatter("%(message)s")
         record = logging.LogRecord(
-            name="test", level=logging.INFO, pathname="", lineno=0,
+            name="test",
+            level=logging.INFO,
+            pathname="",
+            lineno=0,
             msg="Key is sk-proj-abc123def456ghi789jkl012",
-            args=(), exc_info=None,
+            args=(),
+            exc_info=None,
         )
         result = formatter.format(record)
         assert "abc123def456" not in result
@@ -171,3 +191,64 @@ USER=teknium"""
         assert "HOME=/home/user" in result
         assert "SHELL=/bin/bash" in result
         assert "USER=teknium" in result
+
+
+class TestSecretCapturePayloadRedaction:
+    def test_secret_value_field_redacted(self):
+        text = '{"success": true, "secret_value": "sk-test-secret-1234567890"}'
+        result = redact_sensitive_text(text)
+        assert "sk-test-secret-1234567890" not in result
+
+    def test_raw_secret_field_redacted(self):
+        text = '{"raw_secret": "ghp_abc123def456ghi789jkl"}'
+        result = redact_sensitive_text(text)
+        assert "abc123def456" not in result
+
+
+class TestElevenLabsTavilyExaKeys:
+    """Regression tests for ElevenLabs (sk_), Tavily (tvly-), and Exa (exa_) keys."""
+
+    def test_elevenlabs_key_redacted(self):
+        text = "ELEVENLABS_API_KEY=sk_abc123def456ghi789jklmnopqrstu"
+        result = redact_sensitive_text(text)
+        assert "abc123def456ghi" not in result
+
+    def test_elevenlabs_key_in_log_line(self):
+        text = "Connecting to ElevenLabs with key sk_abc123def456ghi789jklmnopqrstu"
+        result = redact_sensitive_text(text)
+        assert "abc123def456ghi" not in result
+
+    def test_tavily_key_redacted(self):
+        text = "TAVILY_API_KEY=tvly-ABCdef123456789GHIJKL0000"
+        result = redact_sensitive_text(text)
+        assert "ABCdef123456789" not in result
+
+    def test_tavily_key_in_log_line(self):
+        text = "Initialising Tavily client with tvly-ABCdef123456789GHIJKL0000"
+        result = redact_sensitive_text(text)
+        assert "ABCdef123456789" not in result
+
+    def test_exa_key_redacted(self):
+        text = "EXA_API_KEY=exa_XYZ789abcdef000000000000000"
+        result = redact_sensitive_text(text)
+        assert "XYZ789abcdef" not in result
+
+    def test_exa_key_in_log_line(self):
+        text = "Using Exa client with key exa_XYZ789abcdef000000000000000"
+        result = redact_sensitive_text(text)
+        assert "XYZ789abcdef" not in result
+
+    def test_all_three_in_env_dump(self):
+        env_dump = (
+            "HOME=/home/user\n"
+            "ELEVENLABS_API_KEY=sk_abc123def456ghi789jklmnopqrstu\n"
+            "TAVILY_API_KEY=tvly-ABCdef123456789GHIJKL0000\n"
+            "EXA_API_KEY=exa_XYZ789abcdef000000000000000\n"
+            "SHELL=/bin/bash\n"
+        )
+        result = redact_sensitive_text(env_dump)
+        assert "abc123def456ghi" not in result
+        assert "ABCdef123456789" not in result
+        assert "XYZ789abcdef" not in result
+        assert "HOME=/home/user" in result
+        assert "SHELL=/bin/bash" in result

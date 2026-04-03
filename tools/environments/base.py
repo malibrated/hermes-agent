@@ -5,18 +5,20 @@ import os
 import subprocess
 from pathlib import Path
 
+from hermes_constants import get_hermes_home
+
 
 def get_sandbox_dir() -> Path:
     """Return the host-side root for all sandbox storage (Docker workspaces,
     Singularity overlays/SIF cache, etc.).
 
-    Configurable via TERMINAL_SANDBOX_DIR. Defaults to ~/.hermes/sandboxes/.
+    Configurable via TERMINAL_SANDBOX_DIR. Defaults to {HERMES_HOME}/sandboxes/.
     """
     custom = os.getenv("TERMINAL_SANDBOX_DIR")
     if custom:
         p = Path(custom)
     else:
-        p = Path.home() / ".hermes" / "sandboxes"
+        p = get_hermes_home() / "sandboxes"
     p.mkdir(parents=True, exist_ok=True)
     return p
 
@@ -59,8 +61,16 @@ class BaseEnvironment(ABC):
     # Shared helpers (eliminate duplication across backends)
     # ------------------------------------------------------------------
 
-    def _prepare_command(self, command: str) -> str:
-        """Transform sudo commands if SUDO_PASSWORD is available."""
+    def _prepare_command(self, command: str) -> tuple[str, str | None]:
+        """Transform sudo commands if SUDO_PASSWORD is available.
+
+        Returns:
+            (transformed_command, sudo_stdin) — see _transform_sudo_command
+            for the full contract.  Callers that drive a subprocess directly
+            should prepend sudo_stdin (when not None) to any stdin_data they
+            pass to Popen.  Callers that embed stdin via heredoc (modal,
+            daytona) handle sudo_stdin in their own execute() method.
+        """
         from tools.terminal_tool import _transform_sudo_command
         return _transform_sudo_command(command)
 

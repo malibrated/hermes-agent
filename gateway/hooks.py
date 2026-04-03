@@ -8,8 +8,9 @@ Hooks are discovered from ~/.hermes/hooks/ directories, each containing:
 
 Events:
   - gateway:startup     -- Gateway process starts
-  - session:start       -- New session created
-  - session:reset       -- User ran /new or /reset
+  - session:start       -- New session created (first message of a new session)
+  - session:end         -- Session ends (user ran /new or /reset)
+  - session:reset       -- Session reset completed (new session entry created)
   - agent:start         -- Agent begins processing a message
   - agent:step          -- Each turn in the tool-calling loop
   - agent:end           -- Agent finishes processing
@@ -20,14 +21,14 @@ Errors in hooks are caught and logged but never block the main pipeline.
 
 import asyncio
 import importlib.util
-import os
-from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
 import yaml
 
+from hermes_cli.config import get_hermes_home
 
-HOOKS_DIR = Path(os.path.expanduser("~/.hermes/hooks"))
+
+HOOKS_DIR = get_hermes_home() / "hooks"
 
 
 class HookRegistry:
@@ -50,14 +51,33 @@ class HookRegistry:
         """Return metadata about all loaded hooks."""
         return list(self._loaded_hooks)
 
+    def _register_builtin_hooks(self) -> None:
+        """Register built-in hooks that are always active."""
+        try:
+            from gateway.builtin_hooks.boot_md import handle as boot_md_handle
+
+            self._handlers.setdefault("gateway:startup", []).append(boot_md_handle)
+            self._loaded_hooks.append({
+                "name": "boot-md",
+                "description": "Run ~/.hermes/BOOT.md on gateway startup",
+                "events": ["gateway:startup"],
+                "path": "(builtin)",
+            })
+        except Exception as e:
+            print(f"[hooks] Could not load built-in boot-md hook: {e}", flush=True)
+
     def discover_and_load(self) -> None:
         """
         Scan the hooks directory for hook directories and load their handlers.
+
+        Also registers built-in hooks that are always active.
 
         Each hook directory must contain:
           - HOOK.yaml with at least 'name' and 'events' keys
           - handler.py with a top-level 'handle' function (sync or async)
         """
+        self._register_builtin_hooks()
+
         if not HOOKS_DIR.exists():
             return
 

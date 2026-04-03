@@ -73,6 +73,7 @@ class TestBuildApiKwargsOpenRouter:
 
     def test_includes_reasoning_in_extra_body(self, monkeypatch):
         agent = _make_agent(monkeypatch, "openrouter")
+        agent.model = "anthropic/claude-sonnet-4-20250514"
         messages = [{"role": "user", "content": "hi"}]
         kwargs = agent._build_api_kwargs(messages)
         extra = kwargs.get("extra_body", {})
@@ -94,6 +95,151 @@ class TestBuildApiKwargsOpenRouter:
         assert "input" not in kwargs
         assert "instructions" not in kwargs
         assert "store" not in kwargs
+
+    def test_strips_codex_only_tool_call_fields_from_chat_messages(self, monkeypatch):
+        agent = _make_agent(monkeypatch, "openrouter")
+        messages = [
+            {"role": "user", "content": "hi"},
+            {
+                "role": "assistant",
+                "content": "Checking now.",
+                "codex_reasoning_items": [
+                    {"type": "reasoning", "id": "rs_1", "encrypted_content": "blob"},
+                ],
+                "tool_calls": [
+                    {
+                        "id": "call_123",
+                        "call_id": "call_123",
+                        "response_item_id": "fc_123",
+                        "type": "function",
+                        "function": {"name": "terminal", "arguments": "{\"command\":\"pwd\"}"},
+                        "extra_content": {"thought_signature": "opaque"},
+                    }
+                ],
+            },
+            {"role": "tool", "tool_call_id": "call_123", "content": "/tmp"},
+        ]
+
+        kwargs = agent._build_api_kwargs(messages)
+
+        assistant_msg = kwargs["messages"][1]
+        tool_call = assistant_msg["tool_calls"][0]
+
+        assert "codex_reasoning_items" not in assistant_msg
+        assert tool_call["id"] == "call_123"
+        assert tool_call["function"]["name"] == "terminal"
+        assert tool_call["extra_content"] == {"thought_signature": "opaque"}
+        assert "call_id" not in tool_call
+        assert "response_item_id" not in tool_call
+
+        # Original stored history must remain unchanged for Responses replay mode.
+        assert messages[1]["tool_calls"][0]["call_id"] == "call_123"
+        assert messages[1]["tool_calls"][0]["response_item_id"] == "fc_123"
+        assert "codex_reasoning_items" in messages[1]
+
+
+class TestDeveloperRoleSwap:
+    """GPT-5 and Codex models should get 'developer' instead of 'system' role."""
+
+    @pytest.mark.parametrize("model", [
+        "openai/gpt-5",
+        "openai/gpt-5-turbo",
+        "openai/gpt-5.4",
+        "gpt-5-mini",
+        "openai/codex-mini",
+        "codex-mini-latest",
+        "openai/codex-pro",
+    ])
+    def test_gpt5_codex_get_developer_role(self, monkeypatch, model):
+        agent = _make_agent(monkeypatch, "openrouter")
+        agent.model = model
+        messages = [
+            {"role": "system", "content": "You are helpful."},
+            {"role": "user", "content": "hi"},
+        ]
+        kwargs = agent._build_api_kwargs(messages)
+        assert kwargs["messages"][0]["role"] == "developer"
+        assert kwargs["messages"][0]["content"] == "You are helpful."
+        assert kwargs["messages"][1]["role"] == "user"
+
+    @pytest.mark.parametrize("model", [
+        "anthropic/claude-opus-4.6",
+        "openai/gpt-4o",
+        "google/gemini-2.5-pro",
+        "deepseek/deepseek-chat",
+        "openai/o3-mini",
+    ])
+    def test_non_matching_models_keep_system_role(self, monkeypatch, model):
+        agent = _make_agent(monkeypatch, "openrouter")
+        agent.model = model
+        messages = [
+            {"role": "system", "content": "You are helpful."},
+            {"role": "user", "content": "hi"},
+        ]
+        kwargs = agent._build_api_kwargs(messages)
+        assert kwargs["messages"][0]["role"] == "system"
+
+    def test_no_system_message_no_crash(self, monkeypatch):
+        agent = _make_agent(monkeypatch, "openrouter")
+        agent.model = "openai/gpt-5"
+        messages = [{"role": "user", "content": "hi"}]
+        kwargs = agent._build_api_kwargs(messages)
+        assert kwargs["messages"][0]["role"] == "user"
+
+    def test_original_messages_not_mutated(self, monkeypatch):
+        agent = _make_agent(monkeypatch, "openrouter")
+        agent.model = "openai/gpt-5"
+        messages = [
+            {"role": "system", "content": "You are helpful."},
+            {"role": "user", "content": "hi"},
+        ]
+        agent._build_api_kwargs(messages)
+        # Original messages must be untouched (internal representation stays "system")
+        assert messages[0]["role"] == "system"
+
+    def test_developer_role_via_nous_portal(self, monkeypatch):
+        agent = _make_agent(monkeypatch, "nous", base_url="https://inference-api.nousresearch.com/v1")
+        agent.model = "gpt-5"
+        messages = [
+            {"role": "system", "content": "You are helpful."},
+            {"role": "user", "content": "hi"},
+        ]
+        kwargs = agent._build_api_kwargs(messages)
+        assert kwargs["messages"][0]["role"] == "developer"
+
+
+class TestBuildApiKwargsAIGateway:
+    def test_uses_chat_completions_format(self, monkeypatch):
+        agent = _make_agent(monkeypatch, "ai-gateway", base_url="https://ai-gateway.vercel.sh/v1")
+        messages = [{"role": "user", "content": "hi"}]
+        kwargs = agent._build_api_kwargs(messages)
+        assert "messages" in kwargs
+        assert "model" in kwargs
+        assert kwargs["messages"][-1]["content"] == "hi"
+
+    def test_no_responses_api_fields(self, monkeypatch):
+        agent = _make_agent(monkeypatch, "ai-gateway", base_url="https://ai-gateway.vercel.sh/v1")
+        messages = [{"role": "user", "content": "hi"}]
+        kwargs = agent._build_api_kwargs(messages)
+        assert "input" not in kwargs
+        assert "instructions" not in kwargs
+        assert "store" not in kwargs
+
+    def test_includes_reasoning_in_extra_body(self, monkeypatch):
+        agent = _make_agent(monkeypatch, "ai-gateway", base_url="https://ai-gateway.vercel.sh/v1")
+        messages = [{"role": "user", "content": "hi"}]
+        kwargs = agent._build_api_kwargs(messages)
+        extra = kwargs.get("extra_body", {})
+        assert "reasoning" in extra
+        assert extra["reasoning"]["enabled"] is True
+
+    def test_includes_tools(self, monkeypatch):
+        agent = _make_agent(monkeypatch, "ai-gateway", base_url="https://ai-gateway.vercel.sh/v1")
+        messages = [{"role": "user", "content": "hi"}]
+        kwargs = agent._build_api_kwargs(messages)
+        assert "tools" in kwargs
+        tool_names = [t["function"]["name"] for t in kwargs["tools"]]
+        assert "web_search" in tool_names
 
 
 class TestBuildApiKwargsNousPortal:
@@ -126,6 +272,52 @@ class TestBuildApiKwargsCustomEndpoint:
         kwargs = agent._build_api_kwargs(messages)
         extra = kwargs.get("extra_body", {})
         assert "reasoning" not in extra
+
+    def test_fireworks_tool_call_payload_strips_codex_only_fields(self, monkeypatch):
+        agent = _make_agent(
+            monkeypatch,
+            "custom",
+            base_url="https://api.fireworks.ai/inference/v1",
+        )
+        messages = [
+            {"role": "user", "content": "hi"},
+            {
+                "role": "assistant",
+                "content": "Checking now.",
+                "codex_reasoning_items": [
+                    {"type": "reasoning", "id": "rs_1", "encrypted_content": "blob"},
+                ],
+                "tool_calls": [
+                    {
+                        "id": "call_fw_123",
+                        "call_id": "call_fw_123",
+                        "response_item_id": "fc_fw_123",
+                        "type": "function",
+                        "function": {
+                            "name": "terminal",
+                            "arguments": "{\"command\":\"pwd\"}",
+                        },
+                    }
+                ],
+            },
+            {"role": "tool", "tool_call_id": "call_fw_123", "content": "/tmp"},
+        ]
+
+        kwargs = agent._build_api_kwargs(messages)
+
+        assert kwargs["tools"][0]["function"]["name"] == "web_search"
+        assert "input" not in kwargs
+        assert kwargs.get("extra_body", {}) == {}
+
+        assistant_msg = kwargs["messages"][1]
+        tool_call = assistant_msg["tool_calls"][0]
+
+        assert "codex_reasoning_items" not in assistant_msg
+        assert tool_call["id"] == "call_fw_123"
+        assert tool_call["type"] == "function"
+        assert tool_call["function"]["name"] == "terminal"
+        assert "call_id" not in tool_call
+        assert "response_item_id" not in tool_call
 
 
 class TestBuildApiKwargsCodex:
@@ -435,14 +627,21 @@ class TestAuxiliaryClientProviderPriority:
         with patch("agent.auxiliary_client._read_nous_auth", return_value={"access_token": "nous-tok"}), \
              patch("agent.auxiliary_client.OpenAI") as mock:
             client, model = get_text_auxiliary_client()
-        assert model == "gemini-3-flash"
+        assert model == "google/gemini-3-flash-preview"
 
     def test_custom_endpoint_when_no_nous(self, monkeypatch):
+        """Custom endpoint is used when no OpenRouter/Nous keys are available.
+
+        Since the March 2026 config refactor, OPENAI_BASE_URL env var is no
+        longer consulted — base_url comes from config.yaml via
+        resolve_runtime_provider.  Mock _resolve_custom_runtime directly.
+        """
         monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
-        monkeypatch.setenv("OPENAI_BASE_URL", "http://localhost:1234/v1")
         monkeypatch.setenv("OPENAI_API_KEY", "local-key")
         from agent.auxiliary_client import get_text_auxiliary_client
         with patch("agent.auxiliary_client._read_nous_auth", return_value=None), \
+             patch("agent.auxiliary_client._resolve_custom_runtime",
+                   return_value=("http://localhost:1234/v1", "local-key")), \
              patch("agent.auxiliary_client.OpenAI") as mock:
             client, model = get_text_auxiliary_client()
         assert mock.call_args.kwargs["base_url"] == "http://localhost:1234/v1"
@@ -456,7 +655,7 @@ class TestAuxiliaryClientProviderPriority:
              patch("agent.auxiliary_client._read_codex_access_token", return_value="codex-tok"), \
              patch("agent.auxiliary_client.OpenAI"):
             client, model = get_text_auxiliary_client()
-        assert model == "gpt-5.3-codex"
+        assert model == "gpt-5.2-codex"
         assert isinstance(client, CodexAuxiliaryClient)
 
 
@@ -600,6 +799,7 @@ class TestReasoningEffortDefaults:
 
     def test_openrouter_default_medium(self, monkeypatch):
         agent = _make_agent(monkeypatch, "openrouter")
+        agent.model = "anthropic/claude-sonnet-4-20250514"
         kwargs = agent._build_api_kwargs([{"role": "user", "content": "hi"}])
         reasoning = kwargs["extra_body"]["reasoning"]
         assert reasoning["effort"] == "medium"
@@ -627,6 +827,7 @@ class TestReasoningEffortDefaults:
 
     def test_openrouter_reasoning_config_override(self, monkeypatch):
         agent = _make_agent(monkeypatch, "openrouter")
+        agent.model = "anthropic/claude-sonnet-4-20250514"
         agent.reasoning_config = {"enabled": True, "effort": "medium"}
         kwargs = agent._build_api_kwargs([{"role": "user", "content": "hi"}])
         assert kwargs["extra_body"]["reasoning"]["effort"] == "medium"

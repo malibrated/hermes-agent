@@ -8,8 +8,32 @@ from tools.session_search_tool import (
     _format_timestamp,
     _format_conversation,
     _truncate_around_matches,
+    _HIDDEN_SESSION_SOURCES,
     MAX_SESSION_CHARS,
+    SESSION_SEARCH_SCHEMA,
 )
+
+
+# =========================================================================
+# Tool schema guidance
+# =========================================================================
+
+class TestHiddenSessionSources:
+    """Verify the _HIDDEN_SESSION_SOURCES constant used for third-party isolation."""
+
+    def test_tool_source_is_hidden(self):
+        assert "tool" in _HIDDEN_SESSION_SOURCES
+
+    def test_standard_sources_not_hidden(self):
+        for src in ("cli", "telegram", "discord", "slack", "cron"):
+            assert src not in _HIDDEN_SESSION_SOURCES
+
+
+class TestSessionSearchSchema:
+    def test_keeps_cross_session_recall_guidance_without_current_session_nudge(self):
+        description = SESSION_SEARCH_SCHEMA["description"]
+        assert "past conversations" in description
+        assert "recent turns of the current session" not in description
 
 
 # =========================================================================
@@ -189,18 +213,74 @@ class TestSessionSearch:
             {"role": "assistant", "content": "hi there"},
         ]
 
-        # Mock the summarizer to return a simple summary
-        import tools.session_search_tool as sst
-        original_client = sst._async_aux_client
-        sst._async_aux_client = None  # Disable summarizer → returns None
-
-        result = json.loads(session_search(
-            query="test", db=mock_db, current_session_id=current_sid,
-        ))
-
-        sst._async_aux_client = original_client
+        # Mock async_call_llm to raise RuntimeError → summarizer returns None
+        from unittest.mock import AsyncMock, patch as _patch
+        with _patch("tools.session_search_tool.async_call_llm",
+                     new_callable=AsyncMock,
+                     side_effect=RuntimeError("no provider")):
+            result = json.loads(session_search(
+                query="test", db=mock_db, current_session_id=current_sid,
+            ))
 
         assert result["success"] is True
         # Current session should be skipped, only other_sid should appear
         assert result["sessions_searched"] == 1
         assert current_sid not in [r.get("session_id") for r in result.get("results", [])]
+
+    def test_current_child_session_excludes_parent_lineage(self):
+        """Compression/delegation parents should be excluded for the active child session."""
+        from unittest.mock import MagicMock
+        from tools.session_search_tool import session_search
+
+        mock_db = MagicMock()
+        mock_db.search_messages.return_value = [
+            {"session_id": "parent_sid", "content": "match", "source": "cli",
+             "session_started": 1709500000, "model": "test"},
+        ]
+
+        def _get_session(session_id):
+            if session_id == "child_sid":
+                return {"parent_session_id": "parent_sid"}
+            if session_id == "parent_sid":
+                return {"parent_session_id": None}
+            return None
+
+        mock_db.get_session.side_effect = _get_session
+
+        result = json.loads(session_search(
+            query="test", db=mock_db, current_session_id="child_sid",
+        ))
+
+        assert result["success"] is True
+        assert result["count"] == 0
+        assert result["results"] == []
+        assert result["sessions_searched"] == 0
+
+    def test_current_root_session_excludes_child_lineage(self):
+        """Delegation child hits should be excluded when they resolve to the current root session."""
+        from unittest.mock import MagicMock
+        from tools.session_search_tool import session_search
+
+        mock_db = MagicMock()
+        mock_db.search_messages.return_value = [
+            {"session_id": "child_sid", "content": "match", "source": "cli",
+             "session_started": 1709500000, "model": "test"},
+        ]
+
+        def _get_session(session_id):
+            if session_id == "root_sid":
+                return {"parent_session_id": None}
+            if session_id == "child_sid":
+                return {"parent_session_id": "root_sid"}
+            return None
+
+        mock_db.get_session.side_effect = _get_session
+
+        result = json.loads(session_search(
+            query="test", db=mock_db, current_session_id="root_sid",
+        ))
+
+        assert result["success"] is True
+        assert result["count"] == 0
+        assert result["results"] == []
+        assert result["sessions_searched"] == 0

@@ -27,25 +27,16 @@ from pathlib import Path
 import fire
 import yaml
 
-# Load .env from ~/.hermes/.env first, then project root as dev fallback
-from dotenv import load_dotenv
-
-_hermes_home = Path(os.getenv("HERMES_HOME", Path.home() / ".hermes"))
-_user_env = _hermes_home / ".env"
+# Load .env from ~/.hermes/.env first, then project root as dev fallback.
+# User-managed env files should override stale shell exports on restart.
+_hermes_home = get_hermes_home()
 _project_env = Path(__file__).parent / '.env'
 
-if _user_env.exists():
-    try:
-        load_dotenv(dotenv_path=_user_env, encoding="utf-8")
-    except UnicodeDecodeError:
-        load_dotenv(dotenv_path=_user_env, encoding="latin-1")
-    print(f"✅ Loaded environment variables from {_user_env}")
-elif _project_env.exists():
-    try:
-        load_dotenv(dotenv_path=_project_env, encoding="utf-8")
-    except UnicodeDecodeError:
-        load_dotenv(dotenv_path=_project_env, encoding="latin-1")
-    print(f"✅ Loaded environment variables from {_project_env}")
+from hermes_cli.env_loader import load_hermes_dotenv
+
+_loaded_env_paths = load_hermes_dotenv(hermes_home=_hermes_home, project_env=_project_env)
+for _env_path in _loaded_env_paths:
+    print(f"✅ Loaded environment variables from {_env_path}")
 
 # Set terminal working directory to tinker-atropos submodule
 # This ensures terminal commands run in the right context for RL work
@@ -62,15 +53,14 @@ else:
 
 # Import agent and tools
 from run_agent import AIAgent
-from model_tools import get_tool_definitions, check_toolset_requirements
-from tools.rl_training_tool import check_rl_api_keys, get_missing_keys
+from tools.rl_training_tool import get_missing_keys
 
 
 # ============================================================================
 # Config Loading
 # ============================================================================
 
-from hermes_constants import OPENROUTER_BASE_URL
+from hermes_constants import get_hermes_home, OPENROUTER_BASE_URL
 
 DEFAULT_MODEL = "anthropic/claude-opus-4.5"
 DEFAULT_BASE_URL = OPENROUTER_BASE_URL

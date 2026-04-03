@@ -6,6 +6,7 @@ and resumed on next creation, preserving the filesystem across sessions.
 """
 
 import logging
+import time
 import math
 import shlex
 import threading
@@ -67,11 +68,13 @@ class DaytonaEnvironment(BaseEnvironment):
         resources = Resources(cpu=cpu, memory=memory_gib, disk=disk_gib)
 
         labels = {"hermes_task_id": task_id}
+        sandbox_name = f"hermes-{task_id}"
 
-        # Try to resume an existing stopped sandbox for this task
+        # Try to resume an existing sandbox for this task
         if self._persistent:
+            # 1. Try name-based lookup (new path)
             try:
-                self._sandbox = self._daytona.find_one(labels=labels)
+                self._sandbox = self._daytona.get(sandbox_name)
                 self._sandbox.start()
                 logger.info("Daytona: resumed sandbox %s for task %s",
                             self._sandbox.id, task_id)
@@ -82,11 +85,26 @@ class DaytonaEnvironment(BaseEnvironment):
                                task_id, e)
                 self._sandbox = None
 
+            # 2. Legacy fallback: find sandbox created before the naming migration
+            if self._sandbox is None:
+                try:
+                    page = self._daytona.list(labels=labels, page=1, limit=1)
+                    if page.items:
+                        self._sandbox = page.items[0]
+                        self._sandbox.start()
+                        logger.info("Daytona: resumed legacy sandbox %s for task %s",
+                                    self._sandbox.id, task_id)
+                except Exception as e:
+                    logger.debug("Daytona: no legacy sandbox found for task %s: %s",
+                                 task_id, e)
+                    self._sandbox = None
+
         # Create a fresh sandbox if we don't have one
         if self._sandbox is None:
             self._sandbox = self._daytona.create(
                 CreateSandboxFromImageParams(
                     image=image,
+                    name=sandbox_name,
                     labels=labels,
                     auto_stop_interval=0,
                     resources=resources,
@@ -95,15 +113,61 @@ class DaytonaEnvironment(BaseEnvironment):
             logger.info("Daytona: created sandbox %s for task %s",
                         self._sandbox.id, task_id)
 
-        # Resolve cwd: detect actual home dir inside the sandbox
-        if self._requested_cwd in ("~", "/home/daytona"):
-            try:
-                home = self._sandbox.process.exec("echo $HOME").result.strip()
-                if home:
+        # Detect remote home dir first so mounts go to the right place.
+        self._remote_home = "/root"
+        try:
+            home = self._sandbox.process.exec("echo $HOME").result.strip()
+            if home:
+                self._remote_home = home
+                if self._requested_cwd in ("~", "/home/daytona"):
                     self.cwd = home
-            except Exception:
-                pass  # leave cwd as-is; sandbox will use its own default
-            logger.info("Daytona: resolved cwd to %s", self.cwd)
+        except Exception:
+            pass
+        logger.info("Daytona: resolved home to %s, cwd to %s", self._remote_home, self.cwd)
+
+        # Track synced files to avoid redundant uploads.
+        # Key: remote_path, Value: (mtime, size)
+        self._synced_files: Dict[str, tuple] = {}
+
+        # Upload credential files and skills directory into the sandbox.
+        self._sync_skills_and_credentials()
+
+    def _upload_if_changed(self, host_path: str, remote_path: str) -> bool:
+        """Upload a file if its mtime/size changed since last sync."""
+        hp = Path(host_path)
+        try:
+            stat = hp.stat()
+            file_key = (stat.st_mtime, stat.st_size)
+        except OSError:
+            return False
+        if self._synced_files.get(remote_path) == file_key:
+            return False
+        try:
+            parent = str(Path(remote_path).parent)
+            self._sandbox.process.exec(f"mkdir -p {parent}")
+            self._sandbox.fs.upload_file(host_path, remote_path)
+            self._synced_files[remote_path] = file_key
+            return True
+        except Exception as e:
+            logger.debug("Daytona: upload failed %s: %s", host_path, e)
+            return False
+
+    def _sync_skills_and_credentials(self) -> None:
+        """Upload changed credential files and skill files into the sandbox."""
+        container_base = f"{self._remote_home}/.hermes"
+        try:
+            from tools.credential_files import get_credential_file_mounts, iter_skills_files
+
+            for mount_entry in get_credential_file_mounts():
+                remote_path = mount_entry["container_path"].replace("/root/.hermes", container_base, 1)
+                if self._upload_if_changed(mount_entry["host_path"], remote_path):
+                    logger.debug("Daytona: synced credential %s", remote_path)
+
+            for entry in iter_skills_files(container_base=container_base):
+                if self._upload_if_changed(entry["host_path"], entry["container_path"]):
+                    logger.debug("Daytona: synced skill %s", entry["container_path"])
+        except Exception as e:
+            logger.debug("Daytona: could not sync skills/credentials: %s", e)
 
     def _ensure_sandbox_ready(self):
         """Restart sandbox if it was stopped (e.g., by a previous interrupt)."""
@@ -142,10 +206,9 @@ class DaytonaEnvironment(BaseEnvironment):
         t = threading.Thread(target=_run, daemon=True)
         t.start()
         # Wait for timeout + generous buffer for network/SDK overhead
-        deadline = timeout + 10
+        deadline = time.monotonic() + timeout + 10
         while t.is_alive():
             t.join(timeout=0.2)
-            deadline -= 0.2
             if is_interrupted():
                 with self._lock:
                     try:
@@ -156,7 +219,7 @@ class DaytonaEnvironment(BaseEnvironment):
                     "output": "[Command interrupted - Daytona sandbox stopped]",
                     "returncode": 130,
                 }
-            if deadline <= 0:
+            if time.monotonic() > deadline:
                 # Shell timeout didn't fire and SDK is hung — force stop
                 with self._lock:
                     try:
@@ -174,6 +237,9 @@ class DaytonaEnvironment(BaseEnvironment):
                 stdin_data: Optional[str] = None) -> dict:
         with self._lock:
             self._ensure_sandbox_ready()
+        # Incremental sync before each command so mid-session credential
+        # refreshes and skill updates are picked up.
+        self._sync_skills_and_credentials()
 
         if stdin_data is not None:
             marker = f"HERMES_EOF_{uuid.uuid4().hex[:8]}"
@@ -181,7 +247,20 @@ class DaytonaEnvironment(BaseEnvironment):
                 marker = f"HERMES_EOF_{uuid.uuid4().hex[:8]}"
             command = f"{command} << '{marker}'\n{stdin_data}\n{marker}"
 
-        exec_command = self._prepare_command(command)
+        exec_command, sudo_stdin = self._prepare_command(command)
+
+        # Daytona sandboxes execute commands via the Daytona SDK and cannot
+        # pipe subprocess stdin directly the way a local Popen can.  When a
+        # sudo password is present, use a shell-level pipe from printf so that
+        # the password feeds sudo -S without appearing as an echo argument
+        # embedded in the shell string.  The password is still visible in the
+        # remote sandbox's command line, but it is not exposed on the user's
+        # local machine — which is the primary threat being mitigated.
+        if sudo_stdin is not None:
+            import shlex
+            exec_command = (
+                f"printf '%s\\n' {shlex.quote(sudo_stdin.rstrip())} | {exec_command}"
+            )
         effective_cwd = cwd or self.cwd or None
         effective_timeout = timeout or self.timeout
 

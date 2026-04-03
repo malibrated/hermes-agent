@@ -27,12 +27,12 @@ Usage:
 
 import os
 import re
-import json
 import difflib
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from typing import Optional, List, Dict, Any, Tuple
+from typing import Optional, List, Dict, Any
 from pathlib import Path
+from hermes_constants import get_hermes_home
 
 
 # ---------------------------------------------------------------------------
@@ -47,7 +47,7 @@ WRITE_DENIED_PATHS = {
         os.path.join(_HOME, ".ssh", "id_rsa"),
         os.path.join(_HOME, ".ssh", "id_ed25519"),
         os.path.join(_HOME, ".ssh", "config"),
-        os.path.join(_HOME, ".hermes", ".env"),
+        str(get_hermes_home() / ".env"),
         os.path.join(_HOME, ".bashrc"),
         os.path.join(_HOME, ".zshrc"),
         os.path.join(_HOME, ".profile"),
@@ -71,18 +71,47 @@ WRITE_DENIED_PREFIXES = [
         os.path.join(_HOME, ".kube"),
         "/etc/sudoers.d",
         "/etc/systemd",
+        os.path.join(_HOME, ".docker"),
+        os.path.join(_HOME, ".azure"),
+        os.path.join(_HOME, ".config", "gh"),
     ]
 ]
 
 
+def _get_safe_write_root() -> Optional[str]:
+    """Return the resolved HERMES_WRITE_SAFE_ROOT path, or None if unset.
+
+    When set, all write_file/patch operations are constrained to this
+    directory tree.  Writes outside it are denied even if the target is
+    not on the static deny list.  Opt-in hardening for gateway/messaging
+    deployments that should only touch a workspace checkout.
+    """
+    root = os.getenv("HERMES_WRITE_SAFE_ROOT", "")
+    if not root:
+        return None
+    try:
+        return os.path.realpath(os.path.expanduser(root))
+    except Exception:
+        return None
+
+
 def _is_write_denied(path: str) -> bool:
     """Return True if path is on the write deny list."""
-    resolved = os.path.realpath(os.path.expanduser(path))
+    resolved = os.path.realpath(os.path.expanduser(str(path)))
+
+    # 1) Static deny list
     if resolved in WRITE_DENIED_PATHS:
         return True
     for prefix in WRITE_DENIED_PREFIXES:
         if resolved.startswith(prefix):
             return True
+
+    # 2) Optional safe-root sandbox
+    safe_root = _get_safe_write_root()
+    if safe_root:
+        if not (resolved == safe_root or resolved.startswith(safe_root + os.sep)):
+            return True
+
     return False
 
 
@@ -400,10 +429,20 @@ class ShellFileOperations(FileOperations):
                     return home
                 elif path.startswith('~/'):
                     return home + path[1:]  # Replace ~ with home
-                # ~username format - let shell expand it
-                expand_result = self._exec(f"echo {path}")
-                if expand_result.exit_code == 0:
-                    return expand_result.stdout.strip()
+                # ~username format - extract and validate username before
+                # letting shell expand it (prevent shell injection via
+                # paths like "~; rm -rf /").
+                rest = path[1:]  # strip leading ~
+                slash_idx = rest.find('/')
+                username = rest[:slash_idx] if slash_idx >= 0 else rest
+                if username and re.fullmatch(r'[a-zA-Z0-9._-]+', username):
+                    # Only expand ~username (not the full path) to avoid shell
+                    # injection via path suffixes like "~user/$(malicious)".
+                    expand_result = self._exec(f"echo ~{username}")
+                    if expand_result.exit_code == 0 and expand_result.stdout.strip():
+                        user_home = expand_result.stdout.strip()
+                        suffix = path[1 + len(username):]  # e.g. "/rest/of/path"
+                        return user_home + suffix
         
         return path
     
@@ -835,47 +874,84 @@ class ShellFileOperations(FileOperations):
     
     def _search_files(self, pattern: str, path: str, limit: int, offset: int) -> SearchResult:
         """Search for files by name pattern (glob-like)."""
-        # Check if find is available (not on Windows without Git Bash/WSL)
-        if not self._has_command('find'):
-            return SearchResult(
-                error="File search requires 'find' command. "
-                      "On Windows, use Git Bash, WSL, or install Unix tools."
-            )
-        
         # Auto-prepend **/ for recursive search if not already present
         if not pattern.startswith('**/') and '/' not in pattern:
             search_pattern = pattern
         else:
             search_pattern = pattern.split('/')[-1]
-        
-        # Use find with modification time sorting
-        # -printf '%T@ %p\n' outputs: timestamp path
-        # sort -rn sorts by timestamp descending (newest first)
-        cmd = f"find {self._escape_shell_arg(path)} -type f -name {self._escape_shell_arg(search_pattern)} " \
-              f"-printf '%T@ %p\\n' 2>/dev/null | sort -rn | tail -n +{offset + 1} | head -n {limit}"
-        
+
+        # Prefer ripgrep: respects .gitignore, excludes hidden dirs by
+        # default, and has parallel directory traversal (~200x faster than
+        # find on wide trees).  Mirrors _search_content which already uses rg.
+        if self._has_command('rg'):
+            return self._search_files_rg(search_pattern, path, limit, offset)
+
+        # Fallback: find (slower, no .gitignore awareness)
+        if not self._has_command('find'):
+            return SearchResult(
+                error="File search requires 'rg' (ripgrep) or 'find'. "
+                      "Install ripgrep for best results: "
+                      "https://github.com/BurntSushi/ripgrep#installation"
+            )
+
+        # Exclude hidden directories (matching ripgrep's default behavior).
+        hidden_exclude = "-not -path '*/.*'"
+
+        cmd = f"find {self._escape_shell_arg(path)} {hidden_exclude} -type f -name {self._escape_shell_arg(search_pattern)} " \
+              f"-printf '%T@ %p\\\\n' 2>/dev/null | sort -rn | tail -n +{offset + 1} | head -n {limit}"
+
         result = self._exec(cmd, timeout=60)
-        
+
         if not result.stdout.strip():
             # Try without -printf (BSD find compatibility -- macOS)
-            cmd_simple = f"find {self._escape_shell_arg(path)} -type f -name {self._escape_shell_arg(search_pattern)} " \
+            cmd_simple = f"find {self._escape_shell_arg(path)} {hidden_exclude} -type f -name {self._escape_shell_arg(search_pattern)} " \
                         f"2>/dev/null | head -n {limit + offset} | tail -n +{offset + 1}"
             result = self._exec(cmd_simple, timeout=60)
-        
+
         files = []
         for line in result.stdout.strip().split('\n'):
             if not line:
                 continue
-            # Parse "timestamp path" format
             parts = line.split(' ', 1)
             if len(parts) == 2 and parts[0].replace('.', '').isdigit():
                 files.append(parts[1])
             else:
                 files.append(line)
-        
+
         return SearchResult(
             files=files,
             total_count=len(files)
+        )
+
+    def _search_files_rg(self, pattern: str, path: str, limit: int, offset: int) -> SearchResult:
+        """Search for files by name using ripgrep's --files mode.
+
+        rg --files respects .gitignore and excludes hidden directories by
+        default, and uses parallel directory traversal for ~200x speedup
+        over find on wide trees.
+        """
+        # rg --files -g uses glob patterns; wrap bare names so they match
+        # at any depth (equivalent to find -name).
+        if '/' not in pattern and not pattern.startswith('*'):
+            glob_pattern = f"*{pattern}"
+        else:
+            glob_pattern = pattern
+
+        fetch_limit = limit + offset
+        cmd = (
+            f"rg --files -g {self._escape_shell_arg(glob_pattern)} "
+            f"{self._escape_shell_arg(path)} 2>/dev/null "
+            f"| head -n {fetch_limit}"
+        )
+        result = self._exec(cmd, timeout=60)
+
+        all_files = [f for f in result.stdout.strip().split('\n') if f]
+        page = all_files[offset:offset + limit]
+
+        return SearchResult(
+            files=page,
+            total_count=len(all_files),
+            truncated=len(all_files) >= fetch_limit,
         )
     
     def _search_content(self, pattern: str, path: str, file_glob: Optional[str],
@@ -956,37 +1032,35 @@ class ShellFileOperations(FileOperations):
             # rg match lines:   "file:lineno:content"  (colon separator)
             # rg context lines: "file-lineno-content"   (dash separator)
             # rg group seps:    "--"
+            # Note: on Windows, paths contain drive letters (e.g. C:\path),
+            # so naive split(":") breaks. Use regex to handle both platforms.
+            _match_re = re.compile(r'^([A-Za-z]:)?(.*?):(\d+):(.*)$')
+            _ctx_re = re.compile(r'^([A-Za-z]:)?(.*?)-(\d+)-(.*)$')
             matches = []
             for line in result.stdout.strip().split('\n'):
                 if not line or line == "--":
                     continue
                 
                 # Try match line first (colon-separated: file:line:content)
-                parts = line.split(':', 2)
-                if len(parts) >= 3:
-                    try:
-                        matches.append(SearchMatch(
-                            path=parts[0],
-                            line_number=int(parts[1]),
-                            content=parts[2][:500]
-                        ))
-                        continue
-                    except ValueError:
-                        pass
+                m = _match_re.match(line)
+                if m:
+                    matches.append(SearchMatch(
+                        path=(m.group(1) or '') + m.group(2),
+                        line_number=int(m.group(3)),
+                        content=m.group(4)[:500]
+                    ))
+                    continue
                 
                 # Try context line (dash-separated: file-line-content)
                 # Only attempt if context was requested to avoid false positives
                 if context > 0:
-                    parts = line.split('-', 2)
-                    if len(parts) >= 3:
-                        try:
-                            matches.append(SearchMatch(
-                                path=parts[0],
-                                line_number=int(parts[1]),
-                                content=parts[2][:500]
-                            ))
-                        except ValueError:
-                            pass
+                    m = _ctx_re.match(line)
+                    if m:
+                        matches.append(SearchMatch(
+                            path=(m.group(1) or '') + m.group(2),
+                            line_number=int(m.group(3)),
+                            content=m.group(4)[:500]
+                        ))
             
             total = len(matches)
             page = matches[offset:offset + limit]
@@ -1000,6 +1074,10 @@ class ShellFileOperations(FileOperations):
                           limit: int, offset: int, output_mode: str, context: int) -> SearchResult:
         """Fallback search using grep."""
         cmd_parts = ["grep", "-rnH"]  # -H forces filename even for single-file searches
+        
+        # Exclude hidden directories (matching ripgrep's default behavior).
+        # This prevents searching inside .hub/index-cache/, .git/, etc.
+        cmd_parts.append("--exclude-dir='.*'")
         
         # Add context if requested
         if context > 0:
@@ -1053,34 +1131,33 @@ class ShellFileOperations(FileOperations):
             # grep match lines:   "file:lineno:content" (colon)
             # grep context lines: "file-lineno-content"  (dash)
             # grep group seps:    "--"
+            # Note: on Windows, paths contain drive letters (e.g. C:\path),
+            # so naive split(":") breaks. Use regex to handle both platforms.
+            _match_re = re.compile(r'^([A-Za-z]:)?(.*?):(\d+):(.*)$')
+            _ctx_re = re.compile(r'^([A-Za-z]:)?(.*?)-(\d+)-(.*)$')
             matches = []
             for line in result.stdout.strip().split('\n'):
                 if not line or line == "--":
                     continue
                 
-                parts = line.split(':', 2)
-                if len(parts) >= 3:
-                    try:
-                        matches.append(SearchMatch(
-                            path=parts[0],
-                            line_number=int(parts[1]),
-                            content=parts[2][:500]
-                        ))
-                        continue
-                    except ValueError:
-                        pass
+                m = _match_re.match(line)
+                if m:
+                    matches.append(SearchMatch(
+                        path=(m.group(1) or '') + m.group(2),
+                        line_number=int(m.group(3)),
+                        content=m.group(4)[:500]
+                    ))
+                    continue
                 
                 if context > 0:
-                    parts = line.split('-', 2)
-                    if len(parts) >= 3:
-                        try:
-                            matches.append(SearchMatch(
-                                path=parts[0],
-                                line_number=int(parts[1]),
-                                content=parts[2][:500]
-                            ))
-                        except ValueError:
-                            pass
+                    m = _ctx_re.match(line)
+                    if m:
+                        matches.append(SearchMatch(
+                            path=(m.group(1) or '') + m.group(2),
+                            line_number=int(m.group(3)),
+                            content=m.group(4)[:500]
+                        ))
+
             
             total = len(matches)
             page = matches[offset:offset + limit]

@@ -16,7 +16,7 @@ Import chain (circular-import safe):
 
 import json
 import logging
-from typing import Any, Callable, Dict, List, Optional, Set
+from typing import Callable, Dict, List, Optional, Set
 
 logger = logging.getLogger(__name__)
 
@@ -26,11 +26,11 @@ class ToolEntry:
 
     __slots__ = (
         "name", "toolset", "schema", "handler", "check_fn",
-        "requires_env", "is_async", "description",
+        "requires_env", "is_async", "description", "emoji",
     )
 
     def __init__(self, name, toolset, schema, handler, check_fn,
-                 requires_env, is_async, description):
+                 requires_env, is_async, description, emoji):
         self.name = name
         self.toolset = toolset
         self.schema = schema
@@ -39,6 +39,7 @@ class ToolEntry:
         self.requires_env = requires_env
         self.is_async = is_async
         self.description = description
+        self.emoji = emoji
 
 
 class ToolRegistry:
@@ -62,8 +63,16 @@ class ToolRegistry:
         requires_env: list = None,
         is_async: bool = False,
         description: str = "",
+        emoji: str = "",
     ):
         """Register a tool.  Called at module-import time by each tool file."""
+        existing = self._tools.get(name)
+        if existing and existing.toolset != toolset:
+            logger.warning(
+                "Tool name collision: '%s' (toolset '%s') is being "
+                "overwritten by toolset '%s'",
+                name, existing.toolset, toolset,
+            )
         self._tools[name] = ToolEntry(
             name=name,
             toolset=toolset,
@@ -73,9 +82,27 @@ class ToolRegistry:
             requires_env=requires_env or [],
             is_async=is_async,
             description=description or schema.get("description", ""),
+            emoji=emoji,
         )
         if check_fn and toolset not in self._toolset_checks:
             self._toolset_checks[toolset] = check_fn
+
+    def deregister(self, name: str) -> None:
+        """Remove a tool from the registry.
+
+        Also cleans up the toolset check if no other tools remain in the
+        same toolset.  Used by MCP dynamic tool discovery to nuke-and-repave
+        when a server sends ``notifications/tools/list_changed``.
+        """
+        entry = self._tools.pop(name, None)
+        if entry is None:
+            return
+        # Drop the toolset check if this was the last tool in that toolset
+        if entry.toolset in self._toolset_checks and not any(
+            e.toolset == entry.toolset for e in self._tools.values()
+        ):
+            self._toolset_checks.pop(entry.toolset, None)
+        logger.debug("Deregistered tool: %s", name)
 
     # ------------------------------------------------------------------
     # Schema retrieval
@@ -88,21 +115,26 @@ class ToolRegistry:
         are included.
         """
         result = []
+        check_results: Dict[Callable, bool] = {}
         for name in sorted(tool_names):
             entry = self._tools.get(name)
             if not entry:
                 continue
             if entry.check_fn:
-                try:
-                    if not entry.check_fn():
+                if entry.check_fn not in check_results:
+                    try:
+                        check_results[entry.check_fn] = bool(entry.check_fn())
+                    except Exception:
+                        check_results[entry.check_fn] = False
                         if not quiet:
-                            logger.debug("Tool %s unavailable (check failed)", name)
-                        continue
-                except Exception:
+                            logger.debug("Tool %s check raised; skipping", name)
+                if not check_results[entry.check_fn]:
                     if not quiet:
-                        logger.debug("Tool %s check raised; skipping", name)
+                        logger.debug("Tool %s unavailable (check failed)", name)
                     continue
-            result.append({"type": "function", "function": entry.schema})
+            # Ensure schema always has a "name" field — use entry.name as fallback
+            schema_with_name = {**entry.schema, "name": entry.name}
+            result.append({"type": "function", "function": schema_with_name})
         return result
 
     # ------------------------------------------------------------------
@@ -136,10 +168,24 @@ class ToolRegistry:
         """Return sorted list of all registered tool names."""
         return sorted(self._tools.keys())
 
+    def get_schema(self, name: str) -> Optional[dict]:
+        """Return a tool's raw schema dict, bypassing check_fn filtering.
+
+        Useful for token estimation and introspection where availability
+        doesn't matter — only the schema content does.
+        """
+        entry = self._tools.get(name)
+        return entry.schema if entry else None
+
     def get_toolset_for_tool(self, name: str) -> Optional[str]:
         """Return the toolset a tool belongs to, or None."""
         entry = self._tools.get(name)
         return entry.toolset if entry else None
+
+    def get_emoji(self, name: str, default: str = "⚡") -> str:
+        """Return the emoji for a tool, or *default* if unset."""
+        entry = self._tools.get(name)
+        return (entry.emoji if entry and entry.emoji else default)
 
     def get_tool_to_toolset_map(self) -> Dict[str, str]:
         """Return ``{tool_name: toolset_name}`` for every registered tool."""

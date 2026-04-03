@@ -147,7 +147,7 @@ Default configuration:
 - Tests 3 models at different scales for robustness:
   - `qwen/qwen3-8b` (small)
   - `z-ai/glm-4.7-flash` (medium)
-  - `minimax/minimax-m2.5` (large)
+  - `minimax/minimax-m2.7` (large)
 - Total: ~144 rollouts
 
 This validates:
@@ -174,21 +174,17 @@ The training loop:
 
 ## Architecture Diagram
 
-```
-┌─────────────────┐     ┌──────────────────┐     ┌─────────────────┐
-│   Atropos API   │◄────│   Environment    │────►│  OpenAI/sglang  │
-│  (run-api)      │     │  (BaseEnv impl)  │     │  Inference API  │
-│  Port 8000      │     │                  │     │  Port 8001      │
-└────────┬────────┘     └──────────────────┘     └────────┬────────┘
-         │                                                │
-         │  Batches (tokens + scores + logprobs)          │
-         │                                                │
-         ▼                                                │
-┌─────────────────┐                                       │
-│  Tinker Trainer  │◄──────────────────────────────────────┘
-│  (LoRA training) │  Serves inference via FastAPI
-│  + FastAPI       │  Trains via Tinker ServiceClient
-└─────────────────┘
+```mermaid
+flowchart LR
+    api["Atropos API<br/>run-api<br/>port 8000"]
+    env["Environment<br/>BaseEnv implementation"]
+    infer["OpenAI / sglang<br/>inference API<br/>port 8001"]
+    trainer["Tinker Trainer<br/>LoRA training + FastAPI"]
+
+    env <--> api
+    env --> infer
+    api -->|"batches: tokens, scores, logprobs"| trainer
+    trainer -->|"serves inference"| infer
 ```
 
 ## Creating Custom Environments
@@ -223,7 +219,7 @@ Training runs log to Weights & Biases with these key metrics:
 
 ## Log Files
 
-Each training run generates log files in `tinker-atropos/logs/`:
+Each training run generates log files in `~/.hermes/logs/rl_training/`:
 
 ```
 logs/

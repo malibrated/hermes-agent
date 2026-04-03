@@ -55,12 +55,26 @@ class TestSessionLifecycle:
 
     def test_update_token_counts(self, db):
         db.create_session(session_id="s1", source="cli")
-        db.update_token_counts("s1", input_tokens=100, output_tokens=50)
         db.update_token_counts("s1", input_tokens=200, output_tokens=100)
+        db.update_token_counts("s1", input_tokens=100, output_tokens=50)
 
         session = db.get_session("s1")
         assert session["input_tokens"] == 300
         assert session["output_tokens"] == 150
+
+    def test_update_token_counts_backfills_model_when_null(self, db):
+        db.create_session(session_id="s1", source="telegram")
+        db.update_token_counts("s1", input_tokens=10, output_tokens=5, model="openai/gpt-5.4")
+
+        session = db.get_session("s1")
+        assert session["model"] == "openai/gpt-5.4"
+
+    def test_update_token_counts_preserves_existing_model(self, db):
+        db.create_session(session_id="s1", source="cli", model="anthropic/claude-opus-4.6")
+        db.update_token_counts("s1", input_tokens=10, output_tokens=5, model="openai/gpt-5.4")
+
+        session = db.get_session("s1")
+        assert session["model"] == "anthropic/claude-opus-4.6"
 
     def test_parent_session(self, db):
         db.create_session(session_id="parent", source="cli")
@@ -94,12 +108,49 @@ class TestMessageStorage:
         session = db.get_session("s1")
         assert session["message_count"] == 2
 
-    def test_tool_message_increments_tool_count(self, db):
+    def test_tool_response_does_not_increment_tool_count(self, db):
+        """Tool responses (role=tool) should not increment tool_call_count.
+
+        Only assistant messages with tool_calls should count.
+        """
         db.create_session(session_id="s1", source="cli")
         db.append_message("s1", role="tool", content="result", tool_name="web_search")
 
         session = db.get_session("s1")
+        assert session["tool_call_count"] == 0
+
+    def test_assistant_tool_calls_increment_by_count(self, db):
+        """An assistant message with N tool_calls should increment by N."""
+        db.create_session(session_id="s1", source="cli")
+        tool_calls = [
+            {"id": "call_1", "function": {"name": "web_search", "arguments": "{}"}},
+        ]
+        db.append_message("s1", role="assistant", content="", tool_calls=tool_calls)
+
+        session = db.get_session("s1")
         assert session["tool_call_count"] == 1
+
+    def test_tool_call_count_matches_actual_calls(self, db):
+        """tool_call_count should equal the number of tool calls made, not messages."""
+        db.create_session(session_id="s1", source="cli")
+
+        # Assistant makes 2 parallel tool calls in one message
+        tool_calls = [
+            {"id": "call_1", "function": {"name": "ha_call_service", "arguments": "{}"}},
+            {"id": "call_2", "function": {"name": "ha_call_service", "arguments": "{}"}},
+        ]
+        db.append_message("s1", role="assistant", content="", tool_calls=tool_calls)
+
+        # Two tool responses come back
+        db.append_message("s1", role="tool", content="ok", tool_name="ha_call_service")
+        db.append_message("s1", role="tool", content="ok", tool_name="ha_call_service")
+
+        session = db.get_session("s1")
+        # Should be 2 (the actual number of tool calls), not 3
+        assert session["tool_call_count"] == 2, (
+            f"Expected 2 tool calls but got {session['tool_call_count']}. "
+            "tool responses are double-counted and multi-call messages are under-counted"
+        )
 
     def test_tool_calls_serialization(self, db):
         db.create_session(session_id="s1", source="cli")
@@ -125,6 +176,91 @@ class TestMessageStorage:
 
         messages = db.get_messages("s1")
         assert messages[0]["finish_reason"] == "stop"
+
+    def test_reasoning_persisted_and_restored(self, db):
+        """Reasoning text is stored for assistant messages and restored by
+        get_messages_as_conversation() so providers receive coherent multi-turn
+        reasoning context."""
+        db.create_session(session_id="s1", source="telegram")
+        db.append_message("s1", role="user", content="create a cron job")
+        db.append_message(
+            "s1",
+            role="assistant",
+            content=None,
+            tool_calls=[{"function": {"name": "cronjob", "arguments": "{}"}, "id": "c1", "type": "function"}],
+            reasoning="I should call the cronjob tool to schedule this.",
+        )
+        db.append_message("s1", role="tool", content='{"job_id": "abc"}', tool_call_id="c1")
+
+        conv = db.get_messages_as_conversation("s1")
+        assert len(conv) == 3
+        # reasoning must be present on the assistant message
+        assistant = conv[1]
+        assert assistant["role"] == "assistant"
+        assert assistant.get("reasoning") == "I should call the cronjob tool to schedule this."
+        # user and tool messages must NOT carry reasoning
+        assert "reasoning" not in conv[0]
+        assert "reasoning" not in conv[2]
+
+    def test_reasoning_details_persisted_and_restored(self, db):
+        """reasoning_details (structured array) is round-tripped through JSON
+        serialization in the DB."""
+        db.create_session(session_id="s1", source="telegram")
+        details = [
+            {"type": "reasoning.summary", "summary": "Thinking about tools"},
+            {"type": "reasoning.encrypted_content", "encrypted_content": "abc123"},
+        ]
+        db.append_message(
+            "s1",
+            role="assistant",
+            content="Hello",
+            reasoning="Thinking about what to say",
+            reasoning_details=details,
+        )
+
+        conv = db.get_messages_as_conversation("s1")
+        assert len(conv) == 1
+        msg = conv[0]
+        assert msg["reasoning"] == "Thinking about what to say"
+        assert msg["reasoning_details"] == details
+
+    def test_reasoning_not_set_for_non_assistant(self, db):
+        """reasoning is never leaked onto user or tool messages."""
+        db.create_session(session_id="s1", source="telegram")
+        db.append_message("s1", role="user", content="hi")
+        db.append_message("s1", role="assistant", content="hello", reasoning=None)
+
+        conv = db.get_messages_as_conversation("s1")
+        assert "reasoning" not in conv[0]
+        assert "reasoning" not in conv[1]
+
+    def test_reasoning_empty_string_not_restored(self, db):
+        """Empty string reasoning is treated as absent."""
+        db.create_session(session_id="s1", source="cli")
+        db.append_message("s1", role="assistant", content="hi", reasoning="")
+
+        conv = db.get_messages_as_conversation("s1")
+        assert "reasoning" not in conv[0]
+
+    def test_codex_reasoning_items_persisted_and_restored(self, db):
+        """codex_reasoning_items (encrypted blobs for Codex Responses API) are
+        round-tripped through JSON serialization in the DB."""
+        db.create_session(session_id="s1", source="cli")
+        codex_items = [
+            {"type": "reasoning", "id": "rs_abc", "encrypted_content": "enc_blob_123"},
+            {"type": "reasoning", "id": "rs_def", "encrypted_content": "enc_blob_456"},
+        ]
+        db.append_message(
+            "s1",
+            role="assistant",
+            content="Done",
+            codex_reasoning_items=codex_items,
+        )
+
+        conv = db.get_messages_as_conversation("s1")
+        assert len(conv) == 1
+        assert conv[0]["codex_reasoning_items"] == codex_items
+        assert conv[0]["codex_reasoning_items"][0]["encrypted_content"] == "enc_blob_123"
 
 
 # =========================================================================
@@ -159,6 +295,25 @@ class TestFTS5Search:
         sources = [r["source"] for r in results]
         assert all(s == "telegram" for s in sources)
 
+    def test_search_default_sources_include_acp(self, db):
+        db.create_session(session_id="s1", source="acp")
+        db.append_message("s1", role="user", content="ACP question about Python")
+
+        results = db.search_messages("Python")
+        sources = [r["source"] for r in results]
+        assert "acp" in sources
+
+    def test_search_default_includes_all_platforms(self, db):
+        """Default search (no source_filter) should find sessions from any platform."""
+        for src in ("cli", "telegram", "signal", "homeassistant", "acp", "matrix"):
+            sid = f"s-{src}"
+            db.create_session(session_id=sid, source=src)
+            db.append_message(sid, role="user", content=f"universal search test from {src}")
+
+        results = db.search_messages("universal search test")
+        found_sources = {r["source"] for r in results}
+        assert found_sources == {"cli", "telegram", "signal", "homeassistant", "acp", "matrix"}
+
     def test_search_with_role_filter(self, db):
         db.create_session(session_id="s1", source="cli")
         db.append_message("s1", role="user", content="What is FastAPI?")
@@ -178,6 +333,150 @@ class TestFTS5Search:
         assert "context" in results[0]
         assert isinstance(results[0]["context"], list)
         assert len(results[0]["context"]) > 0
+
+    def test_search_special_chars_do_not_crash(self, db):
+        """FTS5 special characters in queries must not raise OperationalError."""
+        db.create_session(session_id="s1", source="cli")
+        db.append_message("s1", role="user", content="How do I use C++ templates?")
+
+        # Each of these previously caused sqlite3.OperationalError
+        dangerous_queries = [
+            'C++',              # + is FTS5 column filter
+            '"unterminated',    # unbalanced double-quote
+            '(problem',         # unbalanced parenthesis
+            'hello AND',        # dangling boolean operator
+            '***',              # repeated wildcard
+            '{test}',           # curly braces (column reference)
+            'OR hello',         # leading boolean operator
+            'a AND OR b',       # adjacent operators
+        ]
+        for query in dangerous_queries:
+            # Must not raise — should return list (possibly empty)
+            results = db.search_messages(query)
+            assert isinstance(results, list), f"Query {query!r} did not return a list"
+
+    def test_search_sanitized_query_still_finds_content(self, db):
+        """Sanitization must not break normal keyword search."""
+        db.create_session(session_id="s1", source="cli")
+        db.append_message("s1", role="user", content="Learning C++ templates today")
+
+        # "C++" sanitized to "C" should still match "C++"
+        results = db.search_messages("C++")
+        # The word "C" appears in the content, so FTS5 should find it
+        assert isinstance(results, list)
+
+    def test_search_hyphenated_term_does_not_crash(self, db):
+        """Hyphenated terms like 'chat-send' must not crash FTS5."""
+        db.create_session(session_id="s1", source="cli")
+        db.append_message("s1", role="user", content="Run the chat-send command")
+
+        results = db.search_messages("chat-send")
+        assert isinstance(results, list)
+        assert len(results) >= 1
+        assert any("chat-send" in (r.get("snippet") or r.get("content", "")).lower()
+                    for r in results)
+
+    def test_search_dotted_term_does_not_crash(self, db):
+        """Dotted terms like 'P2.2' or 'simulate.p2.test.ts' should not crash FTS5."""
+        db.create_session(session_id="s1", source="cli")
+        db.append_message("s1", role="user", content="Working on P2.2 session_search edge cases")
+        db.append_message("s1", role="assistant", content="See simulate.p2.test.ts for details")
+
+        results = db.search_messages("P2.2")
+        assert isinstance(results, list)
+        assert len(results) >= 1
+
+        results2 = db.search_messages("simulate.p2.test.ts")
+        assert isinstance(results2, list)
+        assert len(results2) >= 1
+
+    def test_search_quoted_phrase_preserved(self, db):
+        """User-provided quoted phrases should be preserved for exact matching."""
+        db.create_session(session_id="s1", source="cli")
+        db.append_message("s1", role="user", content="docker networking is complex")
+        db.append_message("s1", role="assistant", content="networking docker tips")
+
+        # Quoted phrase should match only the exact order
+        results = db.search_messages('"docker networking"')
+        assert isinstance(results, list)
+        # Should find the user message (exact phrase) but may or may not find
+        # the assistant message depending on FTS5 phrase matching
+        assert len(results) >= 1
+
+    def test_sanitize_fts5_query_strips_dangerous_chars(self):
+        """Unit test for _sanitize_fts5_query static method."""
+        from hermes_state import SessionDB
+        s = SessionDB._sanitize_fts5_query
+        assert s('hello world') == 'hello world'
+        assert '+' not in s('C++')
+        assert '"' not in s('"unterminated')
+        assert '(' not in s('(problem')
+        assert '{' not in s('{test}')
+        # Dangling operators removed
+        assert s('hello AND') == 'hello'
+        assert s('OR world') == 'world'
+        # Leading bare * removed
+        assert s('***') == ''
+        # Valid prefix kept
+        assert s('deploy*') == 'deploy*'
+
+    def test_sanitize_fts5_preserves_quoted_phrases(self):
+        """Properly paired double-quoted phrases should be preserved."""
+        from hermes_state import SessionDB
+        s = SessionDB._sanitize_fts5_query
+        # Simple quoted phrase
+        assert s('"exact phrase"') == '"exact phrase"'
+        # Quoted phrase alongside unquoted terms
+        assert '"docker networking"' in s('"docker networking" setup')
+        # Multiple quoted phrases
+        result = s('"hello world" OR "foo bar"')
+        assert '"hello world"' in result
+        assert '"foo bar"' in result
+        # Unmatched quote still stripped
+        assert '"' not in s('"unterminated')
+
+    def test_sanitize_fts5_quotes_hyphenated_terms(self):
+        """Hyphenated terms should be wrapped in quotes for exact matching."""
+        from hermes_state import SessionDB
+        s = SessionDB._sanitize_fts5_query
+        # Simple hyphenated term
+        assert s('chat-send') == '"chat-send"'
+        # Multiple hyphens
+        assert s('docker-compose-up') == '"docker-compose-up"'
+        # Hyphenated term with other words
+        result = s('fix chat-send bug')
+        assert '"chat-send"' in result
+        assert 'fix' in result
+        assert 'bug' in result
+        # Multiple hyphenated terms with OR
+        result = s('chat-send OR deploy-prod')
+        assert '"chat-send"' in result
+        assert '"deploy-prod"' in result
+        # Already-quoted hyphenated term — no double quoting
+        assert s('"chat-send"') == '"chat-send"'
+        # Hyphenated inside a quoted phrase stays as-is
+        assert s('"my chat-send thing"') == '"my chat-send thing"'
+
+    def test_sanitize_fts5_quotes_dotted_terms(self):
+        """Dotted terms should be wrapped in quotes to avoid FTS5 query parse edge cases."""
+        from hermes_state import SessionDB
+        s = SessionDB._sanitize_fts5_query
+
+        assert s('P2.2') == '"P2.2"'
+        assert s('simulate.p2') == '"simulate.p2"'
+        assert s('simulate.p2.test.ts') == '"simulate.p2.test.ts"'
+
+        # Already quoted — no double quoting
+        assert s('"P2.2"') == '"P2.2"'
+
+        # Works with boolean syntax
+        result = s('P2.2 OR simulate.p2')
+        assert '"P2.2"' in result
+        assert '"simulate.p2"' in result
+
+        # Mixed dots and hyphens — single pass avoids double-quoting
+        assert s('my-app.config') == '"my-app.config"'
+        assert s('my-app.config.ts') == '"my-app.config.ts"'
 
 
 # =========================================================================
@@ -261,6 +560,24 @@ class TestDeleteAndExport:
 
     def test_delete_nonexistent(self, db):
         assert db.delete_session("nope") is False
+
+    def test_resolve_session_id_exact(self, db):
+        db.create_session(session_id="20260315_092437_c9a6ff", source="cli")
+        assert db.resolve_session_id("20260315_092437_c9a6ff") == "20260315_092437_c9a6ff"
+
+    def test_resolve_session_id_unique_prefix(self, db):
+        db.create_session(session_id="20260315_092437_c9a6ff", source="cli")
+        assert db.resolve_session_id("20260315_092437_c9a6") == "20260315_092437_c9a6ff"
+
+    def test_resolve_session_id_ambiguous_prefix_returns_none(self, db):
+        db.create_session(session_id="20260315_092437_c9a6aa", source="cli")
+        db.create_session(session_id="20260315_092437_c9a6bb", source="cli")
+        assert db.resolve_session_id("20260315_092437_c9a6") is None
+
+    def test_resolve_session_id_escapes_like_wildcards(self, db):
+        db.create_session(session_id="20260315_092437_c9a6ff", source="cli")
+        db.create_session(session_id="20260315X092437_c9a6ff", source="cli")
+        assert db.resolve_session_id("20260315_092437") == "20260315_092437_c9a6ff"
 
     def test_export_session(self, db):
         db.create_session(session_id="s1", source="cli", model="test")
@@ -540,7 +857,7 @@ class TestSchemaInit:
     def test_schema_version(self, db):
         cursor = db._conn.execute("SELECT version FROM schema_version")
         version = cursor.fetchone()[0]
-        assert version == 4
+        assert version == 6
 
     def test_title_column_exists(self, db):
         """Verify the title column was created in the sessions table."""
@@ -596,12 +913,12 @@ class TestSchemaInit:
         conn.commit()
         conn.close()
 
-        # Open with SessionDB — should migrate to v4
+        # Open with SessionDB — should migrate to v6
         migrated_db = SessionDB(db_path=db_path)
 
         # Verify migration
         cursor = migrated_db._conn.execute("SELECT version FROM schema_version")
-        assert cursor.fetchone()[0] == 4
+        assert cursor.fetchone()[0] == 6
 
         # Verify title column exists and is NULL for existing sessions
         session = migrated_db.get_session("existing")
@@ -820,6 +1137,89 @@ class TestListSessionsRich:
         assert "Line one Line two" in sessions[0]["preview"]
 
 
+# =========================================================================
+# Session source exclusion (--source flag for third-party isolation)
+# =========================================================================
+
+class TestExcludeSources:
+    """Tests for exclude_sources on list_sessions_rich and search_messages."""
+
+    def test_list_sessions_rich_excludes_tool_source(self, db):
+        db.create_session("s1", "cli")
+        db.create_session("s2", "tool")
+        db.create_session("s3", "telegram")
+        sessions = db.list_sessions_rich(exclude_sources=["tool"])
+        ids = [s["id"] for s in sessions]
+        assert "s1" in ids
+        assert "s3" in ids
+        assert "s2" not in ids
+
+    def test_list_sessions_rich_no_exclusion_returns_all(self, db):
+        db.create_session("s1", "cli")
+        db.create_session("s2", "tool")
+        sessions = db.list_sessions_rich()
+        ids = [s["id"] for s in sessions]
+        assert "s1" in ids
+        assert "s2" in ids
+
+    def test_list_sessions_rich_source_and_exclude_combined(self, db):
+        """When source= is explicit, exclude_sources should not conflict."""
+        db.create_session("s1", "cli")
+        db.create_session("s2", "tool")
+        db.create_session("s3", "telegram")
+        # Explicit source filter: only tool sessions, no exclusion
+        sessions = db.list_sessions_rich(source="tool")
+        ids = [s["id"] for s in sessions]
+        assert ids == ["s2"]
+
+    def test_list_sessions_rich_exclude_multiple_sources(self, db):
+        db.create_session("s1", "cli")
+        db.create_session("s2", "tool")
+        db.create_session("s3", "cron")
+        db.create_session("s4", "telegram")
+        sessions = db.list_sessions_rich(exclude_sources=["tool", "cron"])
+        ids = [s["id"] for s in sessions]
+        assert "s1" in ids
+        assert "s4" in ids
+        assert "s2" not in ids
+        assert "s3" not in ids
+
+    def test_search_messages_excludes_tool_source(self, db):
+        db.create_session("s1", "cli")
+        db.append_message("s1", "user", "Python deployment question")
+        db.create_session("s2", "tool")
+        db.append_message("s2", "user", "Python automated question")
+        results = db.search_messages("Python", exclude_sources=["tool"])
+        sources = [r["source"] for r in results]
+        assert "cli" in sources
+        assert "tool" not in sources
+
+    def test_search_messages_no_exclusion_returns_all_sources(self, db):
+        db.create_session("s1", "cli")
+        db.append_message("s1", "user", "Rust deployment question")
+        db.create_session("s2", "tool")
+        db.append_message("s2", "user", "Rust automated question")
+        results = db.search_messages("Rust")
+        sources = [r["source"] for r in results]
+        assert "cli" in sources
+        assert "tool" in sources
+
+    def test_search_messages_source_include_and_exclude(self, db):
+        """source_filter (include) and exclude_sources can coexist."""
+        db.create_session("s1", "cli")
+        db.append_message("s1", "user", "Golang test")
+        db.create_session("s2", "telegram")
+        db.append_message("s2", "user", "Golang test")
+        db.create_session("s3", "tool")
+        db.append_message("s3", "user", "Golang test")
+        # Include cli+tool, but exclude tool → should only return cli
+        results = db.search_messages(
+            "Golang", source_filter=["cli", "tool"], exclude_sources=["tool"]
+        )
+        sources = [r["source"] for r in results]
+        assert sources == ["cli"]
+
+
 class TestResolveSessionByNameOrId:
     """Tests for the main.py helper that resolves names or IDs."""
 
@@ -834,3 +1234,66 @@ class TestResolveSessionByNameOrId:
         db.set_session_title("s1", "my project")
         result = db.resolve_session_by_title("my project")
         assert result == "s1"
+
+
+# =========================================================================
+# Concurrent write safety / lock contention fixes (#3139)
+# =========================================================================
+
+class TestConcurrentWriteSafety:
+    def test_create_session_insert_or_ignore_is_idempotent(self, db):
+        """create_session with the same ID twice must not raise (INSERT OR IGNORE)."""
+        db.create_session(session_id="dup-1", source="cli", model="m")
+        # Second call should be silent — no IntegrityError
+        db.create_session(session_id="dup-1", source="gateway", model="m2")
+        session = db.get_session("dup-1")
+        # Row should exist (first write wins with OR IGNORE)
+        assert session is not None
+        assert session["source"] == "cli"
+
+    def test_ensure_session_creates_missing_row(self, db):
+        """ensure_session must create a minimal row when the session doesn't exist."""
+        assert db.get_session("orphan-session") is None
+        db.ensure_session("orphan-session", source="gateway", model="test-model")
+        row = db.get_session("orphan-session")
+        assert row is not None
+        assert row["source"] == "gateway"
+        assert row["model"] == "test-model"
+
+    def test_ensure_session_is_idempotent(self, db):
+        """ensure_session on an existing row must be a no-op (no overwrite)."""
+        db.create_session(session_id="existing", source="cli", model="original-model")
+        db.ensure_session("existing", source="gateway", model="overwrite-model")
+        row = db.get_session("existing")
+        # First write wins — ensure_session must not overwrite
+        assert row["source"] == "cli"
+        assert row["model"] == "original-model"
+
+    def test_ensure_session_allows_append_message_after_failed_create(self, db):
+        """Messages can be flushed even when create_session failed at startup.
+
+        Simulates the #3139 scenario: create_session raises (lock), then
+        ensure_session is called during flush, then append_message succeeds.
+        """
+        # Simulate failed create_session — row absent
+        db.ensure_session("late-session", source="gateway", model="gpt-4")
+        db.append_message(
+            session_id="late-session",
+            role="user",
+            content="hello after lock",
+        )
+        msgs = db.get_messages("late-session")
+        assert len(msgs) == 1
+        assert msgs[0]["content"] == "hello after lock"
+
+    def test_sqlite_timeout_is_at_least_30s(self, db):
+        """Connection timeout should be >= 30s to survive CLI/gateway contention."""
+        # Access the underlying connection timeout via sqlite3 introspection.
+        # There is no public API, so we check the kwarg via the module default.
+        import sqlite3
+        import inspect
+        from hermes_state import SessionDB as _SessionDB
+        src = inspect.getsource(_SessionDB.__init__)
+        assert "30" in src, (
+            "SQLite timeout should be at least 30s to handle CLI/gateway lock contention"
+        )

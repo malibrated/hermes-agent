@@ -13,7 +13,8 @@ from pathlib import Path
 from datetime import datetime
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Any, Union
-from enum import Enum
+
+from hermes_cli.config import get_hermes_home
 
 logger = logging.getLogger(__name__)
 
@@ -37,6 +38,7 @@ class DeliveryTarget:
     """
     platform: Platform
     chat_id: Optional[str] = None  # None means use home channel
+    thread_id: Optional[str] = None
     is_origin: bool = False
     is_explicit: bool = False  # True if chat_id was explicitly specified
     
@@ -58,6 +60,7 @@ class DeliveryTarget:
                 return cls(
                     platform=origin.platform,
                     chat_id=origin.chat_id,
+                    thread_id=origin.thread_id,
                     is_origin=True,
                 )
             else:
@@ -67,12 +70,15 @@ class DeliveryTarget:
         if target == "local":
             return cls(platform=Platform.LOCAL)
         
-        # Check for platform:chat_id format
+        # Check for platform:chat_id or platform:chat_id:thread_id format
         if ":" in target:
-            platform_str, chat_id = target.split(":", 1)
+            parts = target.split(":", 2)
+            platform_str = parts[0]
+            chat_id = parts[1] if len(parts) > 1 else None
+            thread_id = parts[2] if len(parts) > 2 else None
             try:
                 platform = Platform(platform_str)
-                return cls(platform=platform, chat_id=chat_id, is_explicit=True)
+                return cls(platform=platform, chat_id=chat_id, thread_id=thread_id, is_explicit=True)
             except ValueError:
                 # Unknown platform, treat as local
                 return cls(platform=Platform.LOCAL)
@@ -91,6 +97,8 @@ class DeliveryTarget:
             return "origin"
         if self.platform == Platform.LOCAL:
             return "local"
+        if self.chat_id and self.thread_id:
+            return f"{self.platform.value}:{self.chat_id}:{self.thread_id}"
         if self.chat_id:
             return f"{self.platform.value}:{self.chat_id}"
         return self.platform.value
@@ -114,7 +122,7 @@ class DeliveryRouter:
         """
         self.config = config
         self.adapters = adapters or {}
-        self.output_dir = Path.home() / ".hermes" / "cron" / "output"
+        self.output_dir = get_hermes_home() / "cron" / "output"
     
     def resolve_targets(
         self,
@@ -150,14 +158,14 @@ class DeliveryRouter:
                     continue
             
             # Deduplicate
-            key = (target.platform, target.chat_id)
+            key = (target.platform, target.chat_id, target.thread_id)
             if key not in seen_platforms:
                 seen_platforms.add(key)
                 targets.append(target)
         
         # Always include local if configured
         if self.config.always_log_local:
-            local_key = (Platform.LOCAL, None)
+            local_key = (Platform.LOCAL, None, None)
             if local_key not in seen_platforms:
                 targets.append(DeliveryTarget(platform=Platform.LOCAL))
         
@@ -254,7 +262,7 @@ class DeliveryRouter:
     def _save_full_output(self, content: str, job_id: str) -> Path:
         """Save full cron output to disk and return the file path."""
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        out_dir = Path.home() / ".hermes" / "cron" / "output"
+        out_dir = get_hermes_home() / "cron" / "output"
         out_dir.mkdir(parents=True, exist_ok=True)
         path = out_dir / f"{job_id}_{timestamp}.txt"
         path.write_text(content)
@@ -285,7 +293,10 @@ class DeliveryRouter:
                 + f"\n\n... [truncated, full output saved to {saved_path}]"
             )
         
-        return await adapter.send(target.chat_id, content, metadata=metadata)
+        send_metadata = dict(metadata or {})
+        if target.thread_id and "thread_id" not in send_metadata:
+            send_metadata["thread_id"] = target.thread_id
+        return await adapter.send(target.chat_id, content, metadata=send_metadata or None)
 
 
 def parse_deliver_spec(
@@ -308,7 +319,7 @@ def build_delivery_context_for_tool(
     origin: Optional[SessionSource] = None
 ) -> Dict[str, Any]:
     """
-    Build context for the schedule_cronjob tool to understand delivery options.
+    Build context for the unified cronjob tool to understand delivery options.
     
     This is passed to the tool so it can validate and explain delivery targets.
     """

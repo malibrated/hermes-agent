@@ -2,7 +2,7 @@
 
 import json
 import pytest
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import patch
 
@@ -16,8 +16,11 @@ from cron.jobs import (
     get_job,
     list_jobs,
     update_job,
+    pause_job,
+    resume_job,
     remove_job,
     mark_job_run,
+    advance_next_run,
     get_due_jobs,
     save_job_output,
 )
@@ -120,10 +123,28 @@ class TestComputeNextRun:
         schedule = {"kind": "once", "run_at": future}
         assert compute_next_run(schedule) == future
 
+    def test_once_recent_past_within_grace_returns_time(self, monkeypatch):
+        now = datetime(2026, 3, 18, 4, 22, 3, tzinfo=timezone.utc)
+        run_at = "2026-03-18T04:22:00+00:00"
+        monkeypatch.setattr("cron.jobs._hermes_now", lambda: now)
+
+        schedule = {"kind": "once", "run_at": run_at}
+
+        assert compute_next_run(schedule) == run_at
+
     def test_once_past_returns_none(self):
         past = (datetime.now() - timedelta(hours=1)).isoformat()
         schedule = {"kind": "once", "run_at": past}
         assert compute_next_run(schedule) is None
+
+    def test_once_with_last_run_returns_none_even_within_grace(self, monkeypatch):
+        now = datetime(2026, 3, 18, 4, 22, 3, tzinfo=timezone.utc)
+        run_at = "2026-03-18T04:22:00+00:00"
+        monkeypatch.setattr("cron.jobs._hermes_now", lambda: now)
+
+        schedule = {"kind": "once", "run_at": run_at}
+
+        assert compute_next_run(schedule, last_run_at=now.isoformat()) is None
 
     def test_interval_first_run(self):
         schedule = {"kind": "interval", "minutes": 60}
@@ -233,14 +254,18 @@ class TestUpdateJob:
         job = create_job(prompt="Daily report", schedule="every 1h")
         assert job["schedule"]["kind"] == "interval"
         assert job["schedule"]["minutes"] == 60
+        old_next_run = job["next_run_at"]
         new_schedule = parse_schedule("every 2h")
-        updated = update_job(job["id"], {"schedule": new_schedule})
+        updated = update_job(job["id"], {"schedule": new_schedule, "schedule_display": new_schedule["display"]})
         assert updated is not None
         assert updated["schedule"]["kind"] == "interval"
         assert updated["schedule"]["minutes"] == 120
+        assert updated["schedule_display"] == "every 120m"
+        assert updated["next_run_at"] != old_next_run
         # Verify persisted to disk
         fetched = get_job(job["id"])
         assert fetched["schedule"]["minutes"] == 120
+        assert fetched["schedule_display"] == "every 120m"
 
     def test_update_enable_disable(self, tmp_cron_dir):
         job = create_job(prompt="Toggle me", schedule="every 1h")
@@ -253,6 +278,26 @@ class TestUpdateJob:
     def test_update_nonexistent_returns_none(self, tmp_cron_dir):
         result = update_job("nonexistent_id", {"name": "X"})
         assert result is None
+
+
+class TestPauseResumeJob:
+    def test_pause_sets_state(self, tmp_cron_dir):
+        job = create_job(prompt="Pause me", schedule="every 1h")
+        paused = pause_job(job["id"], reason="user paused")
+        assert paused is not None
+        assert paused["enabled"] is False
+        assert paused["state"] == "paused"
+        assert paused["paused_reason"] == "user paused"
+
+    def test_resume_reenables_job(self, tmp_cron_dir):
+        job = create_job(prompt="Resume me", schedule="every 1h")
+        pause_job(job["id"], reason="user paused")
+        resumed = resume_job(job["id"])
+        assert resumed is not None
+        assert resumed["enabled"] is True
+        assert resumed["state"] == "scheduled"
+        assert resumed["paused_at"] is None
+        assert resumed["paused_reason"] is None
 
 
 class TestMarkJobRun:
@@ -269,6 +314,24 @@ class TestMarkJobRun:
         # Job should be removed after hitting repeat limit
         assert get_job(job["id"]) is None
 
+    def test_repeat_negative_one_is_infinite(self, tmp_cron_dir):
+        # LLMs often pass repeat=-1 to mean "infinite/forever".
+        # The job must NOT be deleted after runs when repeat <= 0.
+        job = create_job(prompt="Forever", schedule="every 1h", repeat=-1)
+        # -1 should be normalised to None (infinite) at create time
+        assert job["repeat"]["times"] is None
+        # Running it multiple times should never delete it
+        for _ in range(3):
+            mark_job_run(job["id"], success=True)
+            assert get_job(job["id"]) is not None, "job was deleted after run despite infinite repeat"
+
+    def test_repeat_zero_is_infinite(self, tmp_cron_dir):
+        # repeat=0 should also be treated as None (infinite), not "run zero times".
+        job = create_job(prompt="ZeroRepeat", schedule="every 1h", repeat=0)
+        assert job["repeat"]["times"] is None
+        mark_job_run(job["id"], success=True)
+        assert get_job(job["id"]) is not None
+
     def test_error_status(self, tmp_cron_dir):
         job = create_job(prompt="Fail", schedule="every 1h")
         mark_job_run(job["id"], success=False, error="timeout")
@@ -277,17 +340,124 @@ class TestMarkJobRun:
         assert updated["last_error"] == "timeout"
 
 
-class TestGetDueJobs:
-    def test_past_due_returned(self, tmp_cron_dir):
-        job = create_job(prompt="Due now", schedule="every 1h")
-        # Force next_run_at to the past
+class TestAdvanceNextRun:
+    """Tests for advance_next_run() — crash-safety for recurring jobs."""
+
+    def test_advances_interval_job(self, tmp_cron_dir):
+        """Interval jobs should have next_run_at bumped to the next future occurrence."""
+        job = create_job(prompt="Recurring check", schedule="every 1h")
+        # Force next_run_at to 5 minutes ago (i.e. the job is due)
+        jobs = load_jobs()
+        old_next = (datetime.now() - timedelta(minutes=5)).isoformat()
+        jobs[0]["next_run_at"] = old_next
+        save_jobs(jobs)
+
+        result = advance_next_run(job["id"])
+        assert result is True
+
+        updated = get_job(job["id"])
+        from cron.jobs import _ensure_aware, _hermes_now
+        new_next_dt = _ensure_aware(datetime.fromisoformat(updated["next_run_at"]))
+        assert new_next_dt > _hermes_now(), "next_run_at should be in the future after advance"
+
+    def test_advances_cron_job(self, tmp_cron_dir):
+        """Cron-expression jobs should have next_run_at bumped to the next occurrence."""
+        pytest.importorskip("croniter")
+        job = create_job(prompt="Daily wakeup", schedule="15 6 * * *")
+        # Force next_run_at to 30 minutes ago
+        jobs = load_jobs()
+        old_next = (datetime.now() - timedelta(minutes=30)).isoformat()
+        jobs[0]["next_run_at"] = old_next
+        save_jobs(jobs)
+
+        result = advance_next_run(job["id"])
+        assert result is True
+
+        updated = get_job(job["id"])
+        from cron.jobs import _ensure_aware, _hermes_now
+        new_next_dt = _ensure_aware(datetime.fromisoformat(updated["next_run_at"]))
+        assert new_next_dt > _hermes_now(), "next_run_at should be in the future after advance"
+
+    def test_skips_oneshot_job(self, tmp_cron_dir):
+        """One-shot jobs should NOT be advanced — they need to retry on restart."""
+        job = create_job(prompt="Run once", schedule="30m")
+        original_next = get_job(job["id"])["next_run_at"]
+
+        result = advance_next_run(job["id"])
+        assert result is False
+
+        updated = get_job(job["id"])
+        assert updated["next_run_at"] == original_next, "one-shot next_run_at should be unchanged"
+
+    def test_nonexistent_job_returns_false(self, tmp_cron_dir):
+        result = advance_next_run("nonexistent-id")
+        assert result is False
+
+    def test_already_future_stays_future(self, tmp_cron_dir):
+        """If next_run_at is already in the future, advance keeps it in the future (no harm)."""
+        job = create_job(prompt="Future job", schedule="every 1h")
+        # next_run_at is already set to ~1h from now by create_job
+        advance_next_run(job["id"])
+        # Regardless of return value, the job should still be in the future
+        updated = get_job(job["id"])
+        from cron.jobs import _ensure_aware, _hermes_now
+        new_next_dt = _ensure_aware(datetime.fromisoformat(updated["next_run_at"]))
+        assert new_next_dt > _hermes_now(), "next_run_at should remain in the future"
+
+    def test_crash_safety_scenario(self, tmp_cron_dir):
+        """Simulate the crash-loop scenario: after advance, the job should NOT be due."""
+        job = create_job(prompt="Crash test", schedule="every 1h")
+        # Force next_run_at to 5 minutes ago (job is due)
         jobs = load_jobs()
         jobs[0]["next_run_at"] = (datetime.now() - timedelta(minutes=5)).isoformat()
+        save_jobs(jobs)
+
+        # Job should be due before advance
+        due_before = get_due_jobs()
+        assert len(due_before) == 1
+
+        # Advance (simulating what tick() does before run_job)
+        advance_next_run(job["id"])
+
+        # Now the job should NOT be due (simulates restart after crash)
+        due_after = get_due_jobs()
+        assert len(due_after) == 0, "Job should not be due after advance_next_run"
+
+
+class TestGetDueJobs:
+    def test_past_due_within_window_returned(self, tmp_cron_dir):
+        """Jobs within the dynamic grace window are still considered due (not stale).
+
+        For an hourly job, grace = 30 min (half the period, clamped to [120s, 2h]).
+        """
+        job = create_job(prompt="Due now", schedule="every 1h")
+        # Force next_run_at to 10 minutes ago (within the 30-min grace for hourly)
+        jobs = load_jobs()
+        jobs[0]["next_run_at"] = (datetime.now() - timedelta(minutes=10)).isoformat()
         save_jobs(jobs)
 
         due = get_due_jobs()
         assert len(due) == 1
         assert due[0]["id"] == job["id"]
+
+    def test_stale_past_due_skipped(self, tmp_cron_dir):
+        """Recurring jobs past their dynamic grace window are fast-forwarded, not fired.
+
+        For an hourly job, grace = 30 min. Setting 35 min late exceeds the window.
+        """
+        job = create_job(prompt="Stale", schedule="every 1h")
+        # Force next_run_at to 35 minutes ago (beyond the 30-min grace for hourly)
+        jobs = load_jobs()
+        jobs[0]["next_run_at"] = (datetime.now() - timedelta(minutes=35)).isoformat()
+        save_jobs(jobs)
+
+        due = get_due_jobs()
+        assert len(due) == 0
+        # next_run_at should be fast-forwarded to the future
+        updated = get_job(job["id"])
+        from cron.jobs import _ensure_aware, _hermes_now
+        next_dt = _ensure_aware(datetime.fromisoformat(updated["next_run_at"]))
+        assert next_dt > _hermes_now()
 
     def test_future_not_returned(self, tmp_cron_dir):
         create_job(prompt="Not yet", schedule="every 1h")
@@ -303,6 +473,67 @@ class TestGetDueJobs:
 
         due = get_due_jobs()
         assert len(due) == 0
+
+    def test_broken_recent_one_shot_without_next_run_is_recovered(self, tmp_cron_dir, monkeypatch):
+        now = datetime(2026, 3, 18, 4, 22, 30, tzinfo=timezone.utc)
+        monkeypatch.setattr("cron.jobs._hermes_now", lambda: now)
+
+        run_at = "2026-03-18T04:22:00+00:00"
+        save_jobs(
+            [{
+                "id": "oneshot-recover",
+                "name": "Recover me",
+                "prompt": "Word of the day",
+                "schedule": {"kind": "once", "run_at": run_at, "display": "once at 2026-03-18 04:22"},
+                "schedule_display": "once at 2026-03-18 04:22",
+                "repeat": {"times": 1, "completed": 0},
+                "enabled": True,
+                "state": "scheduled",
+                "paused_at": None,
+                "paused_reason": None,
+                "created_at": "2026-03-18T04:21:00+00:00",
+                "next_run_at": None,
+                "last_run_at": None,
+                "last_status": None,
+                "last_error": None,
+                "deliver": "local",
+                "origin": None,
+            }]
+        )
+
+        due = get_due_jobs()
+
+        assert [job["id"] for job in due] == ["oneshot-recover"]
+        assert get_job("oneshot-recover")["next_run_at"] == run_at
+
+    def test_broken_stale_one_shot_without_next_run_is_not_recovered(self, tmp_cron_dir, monkeypatch):
+        now = datetime(2026, 3, 18, 4, 30, 0, tzinfo=timezone.utc)
+        monkeypatch.setattr("cron.jobs._hermes_now", lambda: now)
+
+        save_jobs(
+            [{
+                "id": "oneshot-stale",
+                "name": "Too old",
+                "prompt": "Word of the day",
+                "schedule": {"kind": "once", "run_at": "2026-03-18T04:22:00+00:00", "display": "once at 2026-03-18 04:22"},
+                "schedule_display": "once at 2026-03-18 04:22",
+                "repeat": {"times": 1, "completed": 0},
+                "enabled": True,
+                "state": "scheduled",
+                "paused_at": None,
+                "paused_reason": None,
+                "created_at": "2026-03-18T04:21:00+00:00",
+                "next_run_at": None,
+                "last_run_at": None,
+                "last_status": None,
+                "last_error": None,
+                "deliver": "local",
+                "origin": None,
+            }]
+        )
+
+        assert get_due_jobs() == []
+        assert get_job("oneshot-stale")["next_run_at"] is None
 
 
 class TestSaveJobOutput:

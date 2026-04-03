@@ -207,43 +207,15 @@ memory:
   user_char_limit: 1375     # ~500 tokens
 ```
 
-## Honcho Integration (Cross-Session User Modeling)
+## External Memory Providers
 
-For deeper, AI-generated user understanding that works across tools, you can optionally enable [Honcho](https://honcho.dev/) by Plastic Labs. Honcho runs alongside existing memory — USER.md stays as-is, and Honcho adds an additional layer of context.
+For deeper, persistent memory that goes beyond MEMORY.md and USER.md, Hermes ships with 7 external memory provider plugins — including Honcho, OpenViking, Mem0, Hindsight, Holographic, RetainDB, and ByteRover.
 
-When enabled:
-- **Prefetch**: Each turn, Honcho's user representation is injected into the system prompt
-- **Sync**: After each conversation, messages are synced to Honcho
-- **Query tool**: The agent can actively query its understanding of you via `query_user_context`
-
-**Setup:**
+External providers run **alongside** built-in memory (never replacing it) and add capabilities like knowledge graphs, semantic search, automatic fact extraction, and cross-session user modeling.
 
 ```bash
-# 1. Install the optional dependency
-uv pip install honcho-ai
-
-# 2. Get an API key from https://app.honcho.dev
-
-# 3. Create ~/.honcho/config.json
-cat > ~/.honcho/config.json << 'EOF'
-{
-  "enabled": true,
-  "apiKey": "your-honcho-api-key",
-  "peerName": "your-name",
-  "hosts": {
-    "hermes": {
-      "workspace": "hermes"
-    }
-  }
-}
-EOF
+hermes memory setup      # pick a provider and configure it
+hermes memory status     # check what's active
 ```
 
-Or via environment variable:
-```bash
-hermes config set HONCHO_API_KEY your-key
-```
-
-:::tip
-Honcho is fully opt-in — zero behavior change when disabled or unconfigured. All Honcho calls are non-fatal; if the service is unreachable, the agent continues normally.
-:::
+See the [Memory Providers](./memory-providers.md) guide for full details on each provider, setup instructions, and comparison.

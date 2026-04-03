@@ -19,7 +19,7 @@ import os
 import time
 import uuid
 from datetime import datetime
-from typing import Any, Dict, List, Optional, Set
+from typing import Any, Dict, Optional, Set
 
 try:
     import aiohttp
@@ -83,6 +83,7 @@ class HomeAssistantAdapter(BasePlatformAdapter):
         self._watch_domains: Set[str] = set(extra.get("watch_domains", []))
         self._watch_entities: Set[str] = set(extra.get("watch_entities", []))
         self._ignore_entities: Set[str] = set(extra.get("ignore_entities", []))
+        self._watch_all: bool = bool(extra.get("watch_all", False))
         self._cooldown_seconds: int = int(extra.get("cooldown_seconds", 30))
 
         # Cooldown tracking: entity_id -> last_event_timestamp
@@ -113,7 +114,18 @@ class HomeAssistantAdapter(BasePlatformAdapter):
                 return False
 
             # Dedicated REST session for send() calls
-            self._rest_session = aiohttp.ClientSession()
+            self._rest_session = aiohttp.ClientSession(
+                timeout=aiohttp.ClientTimeout(total=30)
+            )
+
+            # Warn if no event filters are configured
+            if not self._watch_domains and not self._watch_entities and not self._watch_all:
+                logger.warning(
+                    "[%s] No watch_domains, watch_entities, or watch_all configured. "
+                    "All state_changed events will be dropped. Configure filters in "
+                    "your HA platform config to receive events.",
+                    self.name,
+                )
 
             # Start background listener
             self._listen_task = asyncio.create_task(self._listen_loop())
@@ -130,8 +142,10 @@ class HomeAssistantAdapter(BasePlatformAdapter):
         ws_url = self._hass_url.replace("http://", "ws://").replace("https://", "wss://")
         ws_url = f"{ws_url}/api/websocket"
 
-        self._session = aiohttp.ClientSession()
-        self._ws = await self._session.ws_connect(ws_url, heartbeat=30)
+        self._session = aiohttp.ClientSession(
+            timeout=aiohttp.ClientTimeout(total=30)
+        )
+        self._ws = await self._session.ws_connect(ws_url, heartbeat=30, timeout=30)
 
         # Step 1: Receive auth_required
         msg = await self._ws.receive_json()
@@ -257,13 +271,17 @@ class HomeAssistantAdapter(BasePlatformAdapter):
         if entity_id in self._ignore_entities:
             return
 
-        # Apply domain/entity watch filters
+        # Apply domain/entity watch filters (closed by default — require
+        # explicit watch_domains, watch_entities, or watch_all to forward)
         domain = entity_id.split(".")[0] if "." in entity_id else ""
         if self._watch_domains or self._watch_entities:
             domain_match = domain in self._watch_domains if self._watch_domains else False
             entity_match = entity_id in self._watch_entities if self._watch_entities else False
             if not domain_match and not entity_match:
                 return
+        elif not self._watch_all:
+            # No filters configured and watch_all is off — drop the event
+            return
 
         # Apply cooldown
         now = time.time()
@@ -419,9 +437,8 @@ class HomeAssistantAdapter(BasePlatformAdapter):
         except Exception as e:
             return SendResult(success=False, error=str(e))
 
-    async def send_typing(self, chat_id: str) -> None:
+    async def send_typing(self, chat_id: str, metadata=None) -> None:
         """No typing indicator for Home Assistant."""
-        pass
 
     async def get_chat_info(self, chat_id: str) -> Dict[str, Any]:
         """Return basic info about the HA event channel."""

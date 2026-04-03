@@ -46,14 +46,21 @@ from tools.skills_guard import (
 
 
 class TestResolveTrustLevel:
-    def test_builtin_not_exposed(self):
-        # builtin is only used internally, not resolved from source string
-        assert _resolve_trust_level("openai/skills") == "trusted"
+    def test_official_sources_resolve_to_builtin(self):
+        assert _resolve_trust_level("official") == "builtin"
+        assert _resolve_trust_level("official/email/agentmail") == "builtin"
 
     def test_trusted_repos(self):
         assert _resolve_trust_level("openai/skills") == "trusted"
         assert _resolve_trust_level("anthropics/skills") == "trusted"
         assert _resolve_trust_level("openai/skills/some-skill") == "trusted"
+
+    def test_skills_sh_wrapped_trusted_repos(self):
+        assert _resolve_trust_level("skills-sh/openai/skills/skill-creator") == "trusted"
+        assert _resolve_trust_level("skills-sh/anthropics/skills/frontend-design") == "trusted"
+
+    def test_common_skills_sh_prefix_typo_still_maps_to_trusted_repo(self):
+        assert _resolve_trust_level("skils-sh/anthropics/skills/frontend-design") == "trusted"
 
     def test_community_default(self):
         assert _resolve_trust_level("random-user/my-skill") == "community"
@@ -116,10 +123,16 @@ class TestShouldAllowInstall:
         allowed, _ = should_allow_install(self._result("trusted", "caution", f))
         assert allowed is True
 
-    def test_dangerous_blocked_even_trusted(self):
+    def test_trusted_dangerous_blocked_without_force(self):
         f = [Finding("x", "critical", "c", "f", 1, "m", "d")]
         allowed, _ = should_allow_install(self._result("trusted", "dangerous", f))
         assert allowed is False
+
+    def test_builtin_dangerous_allowed_without_force(self):
+        f = [Finding("x", "critical", "c", "f", 1, "m", "d")]
+        allowed, reason = should_allow_install(self._result("builtin", "dangerous", f))
+        assert allowed is True
+        assert "builtin source" in reason
 
     def test_force_overrides_caution(self):
         f = [Finding("x", "high", "c", "f", 1, "m", "d")]
@@ -132,22 +145,49 @@ class TestShouldAllowInstall:
         allowed, _ = should_allow_install(self._result("community", "dangerous", f), force=False)
         assert allowed is False
 
-    def test_force_never_overrides_dangerous(self):
-        """--force must not bypass dangerous verdict (regression test)."""
+    def test_force_overrides_dangerous_for_community(self):
         f = [Finding("x", "critical", "c", "f", 1, "m", "d")]
         allowed, reason = should_allow_install(
             self._result("community", "dangerous", f), force=True
         )
-        assert allowed is False
-        assert "DANGEROUS" in reason
+        assert allowed is True
+        assert "Force-installed" in reason
 
-    def test_force_never_overrides_dangerous_trusted(self):
-        """--force must not bypass dangerous even for trusted sources."""
+    def test_force_overrides_dangerous_for_trusted(self):
         f = [Finding("x", "critical", "c", "f", 1, "m", "d")]
-        allowed, _ = should_allow_install(
+        allowed, reason = should_allow_install(
             self._result("trusted", "dangerous", f), force=True
         )
-        assert allowed is False
+        assert allowed is True
+        assert "Force-installed" in reason
+
+    # -- agent-created policy --
+
+    def test_safe_agent_created_allowed(self):
+        allowed, _ = should_allow_install(self._result("agent-created", "safe"))
+        assert allowed is True
+
+    def test_caution_agent_created_allowed(self):
+        """Agent-created skills with caution verdict (e.g. docker refs) should pass."""
+        f = [Finding("docker_pull", "medium", "supply_chain", "SKILL.md", 1, "docker pull img", "pulls Docker image")]
+        allowed, reason = should_allow_install(self._result("agent-created", "caution", f))
+        assert allowed is True
+        assert "agent-created" in reason
+
+    def test_dangerous_agent_created_asks(self):
+        """Agent-created skills with dangerous verdict return None (ask for confirmation)."""
+        f = [Finding("env_exfil_curl", "critical", "exfiltration", "SKILL.md", 1, "curl $TOKEN", "exfiltration")]
+        allowed, reason = should_allow_install(self._result("agent-created", "dangerous", f))
+        assert allowed is None
+        assert "Requires confirmation" in reason
+
+    def test_force_overrides_dangerous_for_agent_created(self):
+        f = [Finding("x", "critical", "c", "f", 1, "m", "d")]
+        allowed, reason = should_allow_install(
+            self._result("agent-created", "dangerous", f), force=True
+        )
+        assert allowed is True
+        assert "Force-installed" in reason
 
 
 # ---------------------------------------------------------------------------

@@ -8,6 +8,78 @@ description: "Set up Hermes Agent as a Discord bot"
 
 Hermes Agent integrates with Discord as a bot, letting you chat with your AI assistant through direct messages or server channels. The bot receives your messages, processes them through the Hermes Agent pipeline (including tool use, memory, and reasoning), and responds in real time. It supports text, voice messages, file attachments, and slash commands.
 
+Before setup, here's the part most people want to know: how Hermes behaves once it's in your server.
+
+## How Hermes Behaves
+
+| Context | Behavior |
+|---------|----------|
+| **DMs** | Hermes responds to every message. No `@mention` needed. Each DM has its own session. |
+| **Server channels** | By default, Hermes only responds when you `@mention` it. If you post in a channel without mentioning it, Hermes ignores the message. |
+| **Free-response channels** | You can make specific channels mention-free with `DISCORD_FREE_RESPONSE_CHANNELS`, or disable mentions globally with `DISCORD_REQUIRE_MENTION=false`. |
+| **Threads** | Hermes replies in the same thread. Mention rules still apply unless that thread or its parent channel is configured as free-response. Threads stay isolated from the parent channel for session history. |
+| **Shared channels with multiple users** | By default, Hermes isolates session history per user inside the channel for safety and clarity. Two people talking in the same channel do not share one transcript unless you explicitly disable that. |
+| **Messages mentioning other users** | When `DISCORD_IGNORE_NO_MENTION` is `true` (the default), Hermes stays silent if a message @mentions other users but does **not** mention the bot. This prevents the bot from jumping into conversations directed at other people. Set to `false` if you want the bot to respond to all messages regardless of who is mentioned. This only applies in server channels, not DMs. |
+
+:::tip
+If you want a normal bot-help channel where people can talk to Hermes without tagging it every time, add that channel to `DISCORD_FREE_RESPONSE_CHANNELS`.
+:::
+
+### Discord Gateway Model
+
+Hermes on Discord is not a webhook that replies statelessly. It runs through the full messaging gateway, which means each incoming message goes through:
+
+1. authorization (`DISCORD_ALLOWED_USERS`)
+2. mention / free-response checks
+3. session lookup
+4. session transcript loading
+5. normal Hermes agent execution, including tools, memory, and slash commands
+6. response delivery back to Discord
+
+That matters because behavior in a busy server depends on both Discord routing and Hermes session policy.
+
+### Session Model in Discord
+
+By default:
+
+- each DM gets its own session
+- each server thread gets its own session namespace
+- each user in a shared channel gets their own session inside that channel
+
+So if Alice and Bob both talk to Hermes in `#research`, Hermes treats those as separate conversations by default even though they are using the same visible Discord channel.
+
+This is controlled by `config.yaml`:
+
+```yaml
+group_sessions_per_user: true
+```
+
+Set it to `false` only if you explicitly want one shared conversation for the entire room:
+
+```yaml
+group_sessions_per_user: false
+```
+
+Shared sessions can be useful for a collaborative room, but they also mean:
+
+- users share context growth and token costs
+- one person's long tool-heavy task can bloat everyone else's context
+- one person's in-flight run can interrupt another person's follow-up in the same room
+
+### Interrupts and Concurrency
+
+Hermes tracks running agents by session key.
+
+With the default `group_sessions_per_user: true`:
+
+- Alice interrupting her own in-flight request only affects Alice's session in that channel
+- Bob can keep talking in the same channel without inheriting Alice's history or interrupting Alice's run
+
+With `group_sessions_per_user: false`:
+
+- the whole room shares one running-agent slot for that channel/thread
+- follow-up messages from different people can interrupt or queue behind each other
+
 This guide walks you through the full setup process — from creating your bot on Discord's Developer Portal to sending your first message.
 
 ## Step 1: Create a Discord Application
@@ -24,11 +96,15 @@ You'll land on the **General Information** page. Note the **Application ID** —
 1. In the left sidebar, click **Bot**.
 2. Discord automatically creates a bot user for your application. You'll see the bot's username, which you can customize.
 3. Under **Authorization Flow**:
-   - Set **Public Bot** to **OFF** — this prevents other people from inviting your bot to their servers.
+   - Set **Public Bot** to **ON** — required to use the Discord-provided invite link (recommended). This allows the Installation tab to generate a default authorization URL.
    - Leave **Require OAuth2 Code Grant** set to **OFF**.
 
 :::tip
 You can set a custom avatar and banner for your bot on this page. This is what users will see in Discord.
+:::
+
+:::info[Private Bot Alternative]
+If you prefer to keep your bot private (Public Bot = OFF), you **must** use the **Manual URL** method in Step 5 instead of the Installation tab. The Discord-provided link requires Public Bot to be enabled.
 :::
 
 ## Step 3: Enable Privileged Gateway Intents
@@ -38,12 +114,15 @@ This is the most critical step in the entire setup. Without the correct intents 
 On the **Bot** page, scroll down to **Privileged Gateway Intents**. You'll see three toggles:
 
 | Intent | Purpose | Required? |
-|--------|---------|-----------|
+|--------|---------|-----------| 
 | **Presence Intent** | See user online/offline status | Optional |
-| **Server Members Intent** | Access the member list | Optional |
+| **Server Members Intent** | Access the member list, resolve usernames | **Required** |
 | **Message Content Intent** | Read the text content of messages | **Required** |
 
-**Enable Message Content Intent** by toggling it **ON**. Without this, your bot receives message events but the message text is empty — the bot literally cannot see what you typed.
+**Enable both Server Members Intent and Message Content Intent** by toggling them **ON**.
+
+- Without **Message Content Intent**, your bot receives message events but the message text is empty — the bot literally cannot see what you typed.
+- Without **Server Members Intent**, the bot cannot resolve usernames for the allowed users list and may fail to identify who is messaging it.
 
 :::warning[This is the #1 reason Discord bots don't work]
 If your bot is online but never responds to messages, the **Message Content Intent** is almost certainly disabled. Go back to the [Developer Portal](https://discord.com/developers/applications), select your application → Bot → Privileged Gateway Intents, and make sure **Message Content Intent** is toggled ON. Click **Save Changes**.
@@ -74,6 +153,10 @@ Store the token somewhere safe (a password manager, for example). You'll need it
 You need an OAuth2 URL to invite the bot to your server. There are two ways to do this:
 
 ### Option A: Using the Installation Tab (Recommended)
+
+:::note[Requires Public Bot]
+This method requires **Public Bot** to be set to **ON** in Step 2. If you set Public Bot to OFF, use the Manual URL method below instead.
+:::
 
 1. In the left sidebar, click **Installation**.
 2. Under **Installation Contexts**, enable **Guild Install**.
@@ -160,12 +243,33 @@ Add the following to your `~/.hermes/.env` file:
 
 ```bash
 # Required
-DISCORD_BOT_TOKEN=your-bot-token-from-developer-portal
+DISCORD_BOT_TOKEN=your-bot-token
 DISCORD_ALLOWED_USERS=284102345871466496
 
 # Multiple allowed users (comma-separated)
 # DISCORD_ALLOWED_USERS=284102345871466496,198765432109876543
+
+# Optional: respond without @mention (default: true = require mention)
+# DISCORD_REQUIRE_MENTION=false
+
+# Optional: channels where bot responds without @mention (comma-separated channel IDs)
+# DISCORD_FREE_RESPONSE_CHANNELS=1234567890,9876543210
+
+# Optional: ignore messages that @mention other users but NOT the bot (default: true)
+# DISCORD_IGNORE_NO_MENTION=true
 ```
+
+Optional behavior settings in `~/.hermes/config.yaml`:
+
+```yaml
+discord:
+  require_mention: true
+
+group_sessions_per_user: true
+```
+
+- `discord.require_mention: true` keeps Hermes quiet in normal server traffic unless mentioned
+- `group_sessions_per_user: true` keeps each participant's context isolated inside shared channels and threads
 
 ### Start the Gateway
 
@@ -200,18 +304,17 @@ DISCORD_HOME_CHANNEL_NAME="#bot-updates"
 
 Replace the ID with the actual channel ID (right-click → Copy Channel ID with Developer Mode on).
 
-## Bot Behavior
-
-- **Server channels**: The bot responds to all messages from allowed users in channels it can access. It does **not** require a mention or prefix — any message from an allowed user is treated as a prompt.
-- **Direct messages**: DMs always work, even without the Message Content Intent enabled (Discord exempts DMs from this requirement). However, you should still enable the intent for server channel support.
-- **Conversations**: Each channel or DM maintains its own conversation context.
-
 ## Voice Messages
 
 Hermes Agent supports Discord voice messages:
 
-- **Incoming voice messages** are automatically transcribed using Whisper (requires `VOICE_TOOLS_OPENAI_KEY` to be set in your environment).
-- **Text-to-speech**: When TTS is enabled, the bot can send spoken responses as MP3 file attachments.
+- **Incoming voice messages** are automatically transcribed using the configured STT provider: local `faster-whisper` (no key), Groq Whisper (`GROQ_API_KEY`), or OpenAI Whisper (`VOICE_TOOLS_OPENAI_KEY`).
+- **Text-to-speech**: Use `/voice tts` to have the bot send spoken audio responses alongside text replies.
+- **Discord voice channels**: Hermes can also join a voice channel, listen to users speaking, and talk back in the channel.
+
+For the full setup and operational guide, see:
+- [Voice Mode](/docs/user-guide/features/voice-mode)
+- [Use Voice Mode with Hermes](/docs/guides/use-voice-mode-with-hermes)
 
 ## Troubleshooting
 
@@ -251,6 +354,18 @@ Hermes Agent supports Discord voice messages:
 
 **Fix**: Add your User ID to `DISCORD_ALLOWED_USERS` in `~/.hermes/.env` and restart the gateway.
 
+### People in the same channel are sharing context unexpectedly
+
+**Cause**: `group_sessions_per_user` is disabled, or the platform cannot provide a user ID for the messages in that context.
+
+**Fix**: Set this in `~/.hermes/config.yaml` and restart the gateway:
+
+```yaml
+group_sessions_per_user: true
+```
+
+If you intentionally want a shared room conversation, leave it off — just expect shared transcript history and shared interrupt behavior.
+
 ## Security
 
 :::warning
@@ -258,3 +373,6 @@ Always set `DISCORD_ALLOWED_USERS` to restrict who can interact with the bot. Wi
 :::
 
 For more information on securing your Hermes Agent deployment, see the [Security Guide](../security.md).
+
+
+

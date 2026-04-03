@@ -9,13 +9,13 @@ Cache location: ~/.hermes/sticker_cache.json
 """
 
 import json
-import os
 import time
-from pathlib import Path
 from typing import Optional
 
+from hermes_cli.config import get_hermes_home
 
-CACHE_PATH = Path(os.path.expanduser("~/.hermes/sticker_cache.json"))
+
+CACHE_PATH = get_hermes_home() / "sticker_cache.json"
 
 # Vision prompt for describing stickers -- kept concise to save tokens
 STICKER_VISION_PROMPT = (

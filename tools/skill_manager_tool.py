@@ -37,7 +37,9 @@ import logging
 import os
 import re
 import shutil
+import tempfile
 from pathlib import Path
+from hermes_constants import get_hermes_home
 from typing import Dict, Any, Optional
 
 logger = logging.getLogger(__name__)
@@ -58,22 +60,30 @@ def _security_scan_skill(skill_dir: Path) -> Optional[str]:
     try:
         result = scan_skill(skill_dir, source="agent-created")
         allowed, reason = should_allow_install(result)
-        if not allowed:
+        if allowed is False:
             report = format_scan_report(result)
             return f"Security scan blocked this skill ({reason}):\n{report}"
+        if allowed is None:
+            # "ask" — allow but include the warning so the user sees the findings
+            report = format_scan_report(result)
+            logger.warning("Agent-created skill has security findings: %s", reason)
+            # Don't block — return None to allow, but log the warning
+            return None
     except Exception as e:
-        logger.warning("Security scan failed for %s: %s", skill_dir, e)
+        logger.warning("Security scan failed for %s: %s", skill_dir, e, exc_info=True)
     return None
 
 import yaml
 
 
 # All skills live in ~/.hermes/skills/ (single source of truth)
-HERMES_HOME = Path(os.getenv("HERMES_HOME", Path.home() / ".hermes"))
+HERMES_HOME = get_hermes_home()
 SKILLS_DIR = HERMES_HOME / "skills"
 
 MAX_NAME_LENGTH = 64
 MAX_DESCRIPTION_LENGTH = 1024
+MAX_SKILL_CONTENT_CHARS = 100_000   # ~36k tokens at 2.75 chars/token
+MAX_SKILL_FILE_BYTES = 1_048_576    # 1 MiB per supporting file
 
 # Characters allowed in skill names (filesystem-safe, URL-friendly)
 VALID_NAME_RE = re.compile(r'^[a-z0-9][a-z0-9._-]*$')
@@ -101,6 +111,31 @@ def _validate_name(name: str) -> Optional[str]:
         return (
             f"Invalid skill name '{name}'. Use lowercase letters, numbers, "
             f"hyphens, dots, and underscores. Must start with a letter or digit."
+        )
+    return None
+
+
+def _validate_category(category: Optional[str]) -> Optional[str]:
+    """Validate an optional category name used as a single directory segment."""
+    if category is None:
+        return None
+    if not isinstance(category, str):
+        return "Category must be a string."
+
+    category = category.strip()
+    if not category:
+        return None
+    if "/" in category or "\\" in category:
+        return (
+            f"Invalid category '{category}'. Use lowercase letters, numbers, "
+            "hyphens, dots, and underscores. Categories must be a single directory name."
+        )
+    if len(category) > MAX_NAME_LENGTH:
+        return f"Category exceeds {MAX_NAME_LENGTH} characters."
+    if not VALID_NAME_RE.match(category):
+        return (
+            f"Invalid category '{category}'. Use lowercase letters, numbers, "
+            "hyphens, dots, and underscores. Categories must be a single directory name."
         )
     return None
 
@@ -141,6 +176,21 @@ def _validate_frontmatter(content: str) -> Optional[str]:
     if not body:
         return "SKILL.md must have content after the frontmatter (instructions, procedures, etc.)."
 
+    return None
+
+
+def _validate_content_size(content: str, label: str = "SKILL.md") -> Optional[str]:
+    """Check that content doesn't exceed the character limit for agent writes.
+
+    Returns an error message or None if within bounds.
+    """
+    if len(content) > MAX_SKILL_CONTENT_CHARS:
+        return (
+            f"{label} content is {len(content):,} characters "
+            f"(limit: {MAX_SKILL_CONTENT_CHARS:,}). "
+            f"Consider splitting into a smaller SKILL.md with supporting files "
+            f"in references/ or templates/."
+        )
     return None
 
 
@@ -190,6 +240,38 @@ def _validate_file_path(file_path: str) -> Optional[str]:
     return None
 
 
+def _atomic_write_text(file_path: Path, content: str, encoding: str = "utf-8") -> None:
+    """
+    Atomically write text content to a file.
+    
+    Uses a temporary file in the same directory and os.replace() to ensure
+    the target file is never left in a partially-written state if the process
+    crashes or is interrupted.
+    
+    Args:
+        file_path: Target file path
+        content: Content to write
+        encoding: Text encoding (default: utf-8)
+    """
+    file_path.parent.mkdir(parents=True, exist_ok=True)
+    fd, temp_path = tempfile.mkstemp(
+        dir=str(file_path.parent),
+        prefix=f".{file_path.name}.tmp.",
+        suffix="",
+    )
+    try:
+        with os.fdopen(fd, "w", encoding=encoding) as f:
+            f.write(content)
+        os.replace(temp_path, file_path)
+    except Exception:
+        # Clean up temp file on error
+        try:
+            os.unlink(temp_path)
+        except OSError:
+            logger.error("Failed to remove temporary file %s during atomic write", temp_path, exc_info=True)
+        raise
+
+
 # =============================================================================
 # Core actions
 # =============================================================================
@@ -201,8 +283,16 @@ def _create_skill(name: str, content: str, category: str = None) -> Dict[str, An
     if err:
         return {"success": False, "error": err}
 
+    err = _validate_category(category)
+    if err:
+        return {"success": False, "error": err}
+
     # Validate content
     err = _validate_frontmatter(content)
+    if err:
+        return {"success": False, "error": err}
+
+    err = _validate_content_size(content)
     if err:
         return {"success": False, "error": err}
 
@@ -218,9 +308,9 @@ def _create_skill(name: str, content: str, category: str = None) -> Dict[str, An
     skill_dir = _resolve_skill_dir(name, category)
     skill_dir.mkdir(parents=True, exist_ok=True)
 
-    # Write SKILL.md
+    # Write SKILL.md atomically
     skill_md = skill_dir / "SKILL.md"
-    skill_md.write_text(content, encoding="utf-8")
+    _atomic_write_text(skill_md, content)
 
     # Security scan — roll back on block
     scan_error = _security_scan_skill(skill_dir)
@@ -249,6 +339,10 @@ def _edit_skill(name: str, content: str) -> Dict[str, Any]:
     if err:
         return {"success": False, "error": err}
 
+    err = _validate_content_size(content)
+    if err:
+        return {"success": False, "error": err}
+
     existing = _find_skill(name)
     if not existing:
         return {"success": False, "error": f"Skill '{name}' not found. Use skills_list() to see available skills."}
@@ -256,13 +350,13 @@ def _edit_skill(name: str, content: str) -> Dict[str, Any]:
     skill_md = existing["path"] / "SKILL.md"
     # Back up original content for rollback
     original_content = skill_md.read_text(encoding="utf-8") if skill_md.exists() else None
-    skill_md.write_text(content, encoding="utf-8")
+    _atomic_write_text(skill_md, content)
 
     # Security scan — roll back on block
     scan_error = _security_scan_skill(existing["path"])
     if scan_error:
         if original_content is not None:
-            skill_md.write_text(original_content, encoding="utf-8")
+            _atomic_write_text(skill_md, original_content)
         return {"success": False, "error": scan_error}
 
     return {
@@ -310,27 +404,29 @@ def _patch_skill(
 
     content = target.read_text(encoding="utf-8")
 
-    count = content.count(old_string)
-    if count == 0:
+    # Use the same fuzzy matching engine as the file patch tool.
+    # This handles whitespace normalization, indentation differences,
+    # escape sequences, and block-anchor matching — saving the agent
+    # from exact-match failures on minor formatting mismatches.
+    from tools.fuzzy_match import fuzzy_find_and_replace
+
+    new_content, match_count, match_error = fuzzy_find_and_replace(
+        content, old_string, new_string, replace_all
+    )
+    if match_error:
         # Show a short preview of the file so the model can self-correct
         preview = content[:500] + ("..." if len(content) > 500 else "")
         return {
             "success": False,
-            "error": "old_string not found in the file.",
+            "error": match_error,
             "file_preview": preview,
         }
 
-    if count > 1 and not replace_all:
-        return {
-            "success": False,
-            "error": (
-                f"old_string matched {count} times. Provide more surrounding context "
-                f"to make the match unique, or set replace_all=true to replace all occurrences."
-            ),
-            "match_count": count,
-        }
-
-    new_content = content.replace(old_string, new_string) if replace_all else content.replace(old_string, new_string, 1)
+    # Check size limit on the result
+    target_label = "SKILL.md" if not file_path else file_path
+    err = _validate_content_size(new_content, label=target_label)
+    if err:
+        return {"success": False, "error": err}
 
     # If patching SKILL.md, validate frontmatter is still intact
     if not file_path:
@@ -342,18 +438,17 @@ def _patch_skill(
             }
 
     original_content = content  # for rollback
-    target.write_text(new_content, encoding="utf-8")
+    _atomic_write_text(target, new_content)
 
     # Security scan — roll back on block
     scan_error = _security_scan_skill(skill_dir)
     if scan_error:
-        target.write_text(original_content, encoding="utf-8")
+        _atomic_write_text(target, original_content)
         return {"success": False, "error": scan_error}
 
-    replacements = count if replace_all else 1
     return {
         "success": True,
-        "message": f"Patched {'SKILL.md' if not file_path else file_path} in skill '{name}' ({replacements} replacement{'s' if replacements > 1 else ''}).",
+        "message": f"Patched {'SKILL.md' if not file_path else file_path} in skill '{name}' ({match_count} replacement{'s' if match_count > 1 else ''}).",
     }
 
 
@@ -386,6 +481,21 @@ def _write_file(name: str, file_path: str, file_content: str) -> Dict[str, Any]:
     if not file_content and file_content != "":
         return {"success": False, "error": "file_content is required."}
 
+    # Check size limits
+    content_bytes = len(file_content.encode("utf-8"))
+    if content_bytes > MAX_SKILL_FILE_BYTES:
+        return {
+            "success": False,
+            "error": (
+                f"File content is {content_bytes:,} bytes "
+                f"(limit: {MAX_SKILL_FILE_BYTES:,} bytes / 1 MiB). "
+                f"Consider splitting into smaller files."
+            ),
+        }
+    err = _validate_content_size(file_content, label=file_path)
+    if err:
+        return {"success": False, "error": err}
+
     existing = _find_skill(name)
     if not existing:
         return {"success": False, "error": f"Skill '{name}' not found. Create it first with action='create'."}
@@ -394,13 +504,13 @@ def _write_file(name: str, file_path: str, file_content: str) -> Dict[str, Any]:
     target.parent.mkdir(parents=True, exist_ok=True)
     # Back up for rollback
     original_content = target.read_text(encoding="utf-8") if target.exists() else None
-    target.write_text(file_content, encoding="utf-8")
+    _atomic_write_text(target, file_content)
 
     # Security scan — roll back on block
     scan_error = _security_scan_skill(existing["path"])
     if scan_error:
         if original_content is not None:
-            target.write_text(original_content, encoding="utf-8")
+            _atomic_write_text(target, original_content)
         else:
             target.unlink(missing_ok=True)
         return {"success": False, "error": scan_error}
@@ -507,6 +617,13 @@ def skill_manage(
     else:
         result = {"success": False, "error": f"Unknown action '{action}'. Use: create, edit, patch, delete, write_file, remove_file"}
 
+    if result.get("success"):
+        try:
+            from agent.prompt_builder import clear_skills_system_prompt_cache
+            clear_skills_system_prompt_cache(clear_snapshot=True)
+        except Exception:
+            pass
+
     return json.dumps(result, ensure_ascii=False)
 
 
@@ -528,7 +645,8 @@ SKILL_MANAGE_SCHEMA = {
         "user-corrected approach worked, non-trivial workflow discovered, "
         "or user asks you to remember a procedure.\n"
         "Update when: instructions stale/wrong, OS-specific failures, "
-        "missing steps or pitfalls found during use.\n\n"
+        "missing steps or pitfalls found during use. "
+        "If you used a skill and hit issues not covered by it, patch it immediately.\n\n"
         "After difficult/iterative tasks, offer to save as a skill. "
         "Skip for simple one-offs. Confirm with user before creating/deleting.\n\n"
         "Good skills: trigger conditions, numbered steps with exact commands, "
@@ -620,4 +738,5 @@ registry.register(
         old_string=args.get("old_string"),
         new_string=args.get("new_string"),
         replace_all=args.get("replace_all", False)),
+    emoji="📝",
 )

@@ -7,7 +7,7 @@ or corrupt user-visible content.
 
 import re
 import sys
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -28,13 +28,13 @@ def _ensure_telegram_mock():
     mod.constants.ChatType.SUPERGROUP = "supergroup"
     mod.constants.ChatType.CHANNEL = "channel"
     mod.constants.ChatType.PRIVATE = "private"
-    for name in ("telegram", "telegram.ext", "telegram.constants"):
+    for name in ("telegram", "telegram.ext", "telegram.constants", "telegram.request"):
         sys.modules.setdefault(name, mod)
 
 
 _ensure_telegram_mock()
 
-from gateway.platforms.telegram import TelegramAdapter, _escape_mdv2  # noqa: E402
+from gateway.platforms.telegram import TelegramAdapter, _escape_mdv2, _strip_mdv2  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
@@ -145,6 +145,31 @@ class TestFormatMessageCodeBlocks:
         assert "block2" in result
         # "text" between blocks should be present
         assert "text" in result
+
+    def test_inline_code_backslashes_escaped(self, adapter):
+        r"""Backslashes in inline code must be escaped for MarkdownV2."""
+        text = r"Check `C:\ProgramData\VMware\` path"
+        result = adapter.format_message(text)
+        assert r"`C:\\ProgramData\\VMware\\`" in result
+
+    def test_fenced_code_block_backslashes_escaped(self, adapter):
+        r"""Backslashes in fenced code blocks must be escaped for MarkdownV2."""
+        text = "```\npath = r'C:\\Users\\test'\n```"
+        result = adapter.format_message(text)
+        assert r"C:\\Users\\test" in result
+
+    def test_fenced_code_block_backticks_escaped(self, adapter):
+        r"""Backticks inside fenced code blocks must be escaped for MarkdownV2."""
+        text = "```\necho `hostname`\n```"
+        result = adapter.format_message(text)
+        assert r"echo \`hostname\`" in result
+
+    def test_inline_code_no_double_escape(self, adapter):
+        r"""Already-escaped backslashes should not be quadruple-escaped."""
+        text = r"Use `\\server\share`"
+        result = adapter.format_message(text)
+        # \\ in input → \\\\ in output (each \ escaped once)
+        assert r"`\\\\server\\share`" in result
 
 
 # =========================================================================
@@ -296,6 +321,95 @@ class TestItalicNewlineBug:
 
 
 # =========================================================================
+# format_message - strikethrough
+# =========================================================================
+
+
+class TestFormatMessageStrikethrough:
+    def test_strikethrough_converted(self, adapter):
+        result = adapter.format_message("This is ~~deleted~~ text")
+        assert "~deleted~" in result
+        assert "~~" not in result
+
+    def test_strikethrough_with_special_chars(self, adapter):
+        result = adapter.format_message("~~hello.world!~~")
+        assert "~hello\\.world\\!~" in result
+
+    def test_strikethrough_in_code_not_converted(self, adapter):
+        result = adapter.format_message("`~~not struck~~`")
+        assert "`~~not struck~~`" in result
+
+    def test_strikethrough_with_bold(self, adapter):
+        result = adapter.format_message("**bold** and ~~struck~~")
+        assert "*bold*" in result
+        assert "~struck~" in result
+
+
+# =========================================================================
+# format_message - spoiler
+# =========================================================================
+
+
+class TestFormatMessageSpoiler:
+    def test_spoiler_converted(self, adapter):
+        result = adapter.format_message("This is ||hidden|| text")
+        assert "||hidden||" in result
+
+    def test_spoiler_with_special_chars(self, adapter):
+        result = adapter.format_message("||hello.world!||")
+        assert "||hello\\.world\\!||" in result
+
+    def test_spoiler_in_code_not_converted(self, adapter):
+        result = adapter.format_message("`||not spoiler||`")
+        assert "`||not spoiler||`" in result
+
+    def test_spoiler_pipes_not_escaped(self, adapter):
+        """The || delimiters must not be escaped as \\|\\|."""
+        result = adapter.format_message("||secret||")
+        assert "\\|\\|" not in result
+        assert "||secret||" in result
+
+
+# =========================================================================
+# format_message - blockquote
+# =========================================================================
+
+
+class TestFormatMessageBlockquote:
+    def test_blockquote_converted(self, adapter):
+        result = adapter.format_message("> This is a quote")
+        assert "> This is a quote" in result
+        # > must NOT be escaped
+        assert "\\>" not in result
+
+    def test_blockquote_with_special_chars(self, adapter):
+        result = adapter.format_message("> Hello (world)!")
+        assert "> Hello \\(world\\)\\!" in result
+        assert "\\>" not in result
+
+    def test_blockquote_multiline(self, adapter):
+        text = "> Line one\n> Line two"
+        result = adapter.format_message(text)
+        assert "> Line one" in result
+        assert "> Line two" in result
+        assert "\\>" not in result
+
+    def test_blockquote_in_code_not_converted(self, adapter):
+        result = adapter.format_message("```\n> not a quote\n```")
+        assert "> not a quote" in result
+
+    def test_nested_blockquote(self, adapter):
+        result = adapter.format_message(">> Nested quote")
+        assert ">> Nested quote" in result
+        assert "\\>" not in result
+
+    def test_gt_in_middle_of_line_still_escaped(self, adapter):
+        """Only > at line start is a blockquote; mid-line > should be escaped."""
+        result = adapter.format_message("5 > 3")
+        assert "\\>" in result
+
+
+# =========================================================================
 # format_message - mixed/complex
 # =========================================================================
 
@@ -360,3 +474,65 @@ class TestFormatMessageComplex:
         assert "Header" in result
         assert "block" in result
         assert "url.com" in result
+
+
+# =========================================================================
+# _strip_mdv2 — plaintext fallback
+# =========================================================================
+
+
+class TestStripMdv2:
+    def test_removes_escape_backslashes(self):
+        assert _strip_mdv2(r"hello\.world\!") == "hello.world!"
+
+    def test_removes_bold_markers(self):
+        assert _strip_mdv2("*bold text*") == "bold text"
+
+    def test_removes_italic_markers(self):
+        assert _strip_mdv2("_italic text_") == "italic text"
+
+    def test_removes_both_bold_and_italic(self):
+        result = _strip_mdv2("*bold* and _italic_")
+        assert result == "bold and italic"
+
+    def test_preserves_snake_case(self):
+        assert _strip_mdv2("my_variable_name") == "my_variable_name"
+
+    def test_preserves_multi_underscore_identifier(self):
+        assert _strip_mdv2("some_func_call here") == "some_func_call here"
+
+    def test_plain_text_unchanged(self):
+        assert _strip_mdv2("plain text") == "plain text"
+
+    def test_empty_string(self):
+        assert _strip_mdv2("") == ""
+
+    def test_removes_strikethrough_markers(self):
+        assert _strip_mdv2("~struck text~") == "struck text"
+
+    def test_removes_spoiler_markers(self):
+        assert _strip_mdv2("||hidden text||") == "hidden text"
+
+
+@pytest.mark.asyncio
+async def test_send_escapes_chunk_indicator_for_markdownv2(adapter):
+    adapter.MAX_MESSAGE_LENGTH = 80
+    adapter._bot = MagicMock()
+
+    sent_texts = []
+
+    async def _fake_send_message(**kwargs):
+        sent_texts.append(kwargs["text"])
+        msg = MagicMock()
+        msg.message_id = len(sent_texts)
+        return msg
+
+    adapter._bot.send_message = AsyncMock(side_effect=_fake_send_message)
+
+    content = ("**bold** chunk content " * 12).strip()
+    result = await adapter.send("123", content)
+
+    assert result.success is True
+    assert len(sent_texts) > 1
+    assert re.search(r" \\\([0-9]+/[0-9]+\\\)$", sent_texts[0])
+    assert re.search(r" \\\([0-9]+/[0-9]+\\\)$", sent_texts[-1])

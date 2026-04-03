@@ -1,7 +1,7 @@
 """Tests for the delivery routing module."""
 
 from gateway.config import Platform, GatewayConfig, PlatformConfig, HomeChannel
-from gateway.delivery import DeliveryTarget, parse_deliver_spec
+from gateway.delivery import DeliveryRouter, DeliveryTarget, parse_deliver_spec
 from gateway.session import SessionSource
 
 
@@ -24,10 +24,11 @@ class TestParseTargetPlatformChat:
         assert target.chat_id is None
 
     def test_origin_with_source(self):
-        origin = SessionSource(platform=Platform.TELEGRAM, chat_id="789")
+        origin = SessionSource(platform=Platform.TELEGRAM, chat_id="789", thread_id="42")
         target = DeliveryTarget.parse("origin", origin=origin)
         assert target.platform == Platform.TELEGRAM
         assert target.chat_id == "789"
+        assert target.thread_id == "42"
         assert target.is_origin is True
 
     def test_origin_without_source(self):
@@ -64,7 +65,7 @@ class TestParseDeliverSpec:
 
 class TestTargetToStringRoundtrip:
     def test_origin_roundtrip(self):
-        origin = SessionSource(platform=Platform.TELEGRAM, chat_id="111")
+        origin = SessionSource(platform=Platform.TELEGRAM, chat_id="111", thread_id="42")
         target = DeliveryTarget.parse("origin", origin=origin)
         assert target.to_string() == "origin"
 
@@ -84,3 +85,12 @@ class TestTargetToStringRoundtrip:
         reparsed = DeliveryTarget.parse(s)
         assert reparsed.platform == Platform.TELEGRAM
         assert reparsed.chat_id == "999"
+
+
+class TestDeliveryRouter:
+    def test_resolve_targets_does_not_duplicate_local_when_explicit(self):
+        router = DeliveryRouter(GatewayConfig(always_log_local=True))
+
+        targets = router.resolve_targets(["local"])
+
+        assert [target.platform for target in targets] == [Platform.LOCAL]

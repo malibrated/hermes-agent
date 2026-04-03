@@ -1,12 +1,13 @@
 """Tests for set_config_value — verifying secrets route to .env and config to config.yaml."""
 
+import argparse
 import os
 from pathlib import Path
 from unittest.mock import patch, call
 
 import pytest
 
-from hermes_cli.config import set_config_value
+from hermes_cli.config import set_config_value, config_command
 
 
 @pytest.fixture(autouse=True)
@@ -115,3 +116,52 @@ class TestConfigYamlRouting:
         set_config_value("terminal.docker_image", "python:3.12")
         config = _read_config(_isolated_hermes_home)
         assert "python:3.12" in config
+
+    def test_terminal_docker_cwd_mount_flag_goes_to_config_and_env(self, _isolated_hermes_home):
+        set_config_value("terminal.docker_mount_cwd_to_workspace", "true")
+        config = _read_config(_isolated_hermes_home)
+        env_content = _read_env(_isolated_hermes_home)
+        assert "docker_mount_cwd_to_workspace: 'true'" in config or "docker_mount_cwd_to_workspace: true" in config
+        assert (
+            "TERMINAL_DOCKER_MOUNT_CWD_TO_WORKSPACE=true" in env_content
+            or "TERMINAL_DOCKER_MOUNT_CWD_TO_WORKSPACE=True" in env_content
+        )
+
+
+# ---------------------------------------------------------------------------
+# Empty / falsy values — regression tests for #4277
+# ---------------------------------------------------------------------------
+
+class TestFalsyValues:
+    """config set should accept empty strings and falsy values like '0'."""
+
+    def test_empty_string_routes_to_env(self, _isolated_hermes_home):
+        """Blanking an API key should write an empty value to .env."""
+        set_config_value("OPENROUTER_API_KEY", "")
+        env_content = _read_env(_isolated_hermes_home)
+        assert "OPENROUTER_API_KEY=" in env_content
+
+    def test_empty_string_routes_to_config(self, _isolated_hermes_home):
+        """Blanking a config key should write an empty string to config.yaml."""
+        set_config_value("model", "")
+        config = _read_config(_isolated_hermes_home)
+        assert "model: ''" in config or "model: \"\"" in config
+
+    def test_zero_routes_to_config(self, _isolated_hermes_home):
+        """Setting a config key to '0' should write 0 to config.yaml."""
+        set_config_value("verbose", "0")
+        config = _read_config(_isolated_hermes_home)
+        assert "verbose: 0" in config
+
+    def test_config_command_rejects_missing_value(self):
+        """config set with no value arg (None) should still exit."""
+        args = argparse.Namespace(config_command="set", key="model", value=None)
+        with pytest.raises(SystemExit):
+            config_command(args)
+
+    def test_config_command_accepts_empty_string(self, _isolated_hermes_home):
+        """config set KEY '' should not exit — it should set the value."""
+        args = argparse.Namespace(config_command="set", key="model", value="")
+        config_command(args)
+        config = _read_config(_isolated_hermes_home)
+        assert "model" in config

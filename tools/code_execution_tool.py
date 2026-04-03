@@ -300,17 +300,18 @@ def _rpc_server_loop(
                 # their status prints don't leak into the CLI spinner.
                 try:
                     _real_stdout, _real_stderr = sys.stdout, sys.stderr
-                    sys.stdout = open(os.devnull, "w")
-                    sys.stderr = open(os.devnull, "w")
+                    devnull = open(os.devnull, "w")
                     try:
+                        sys.stdout = devnull
+                        sys.stderr = devnull
                         result = handle_function_call(
                             tool_name, tool_args, task_id=task_id
                         )
                     finally:
-                        sys.stdout.close()
-                        sys.stderr.close()
                         sys.stdout, sys.stderr = _real_stdout, _real_stderr
+                        devnull.close()
                 except Exception as exc:
+                    logger.error("Tool call failed in sandbox: %s", exc, exc_info=True)
                     result = json.dumps({"error": str(exc)})
 
                 tool_call_counter[0] += 1
@@ -327,15 +328,15 @@ def _rpc_server_loop(
                 conn.sendall((result + "\n").encode())
 
     except socket.timeout:
-        pass
-    except OSError:
-        pass
+        logger.debug("RPC listener socket timeout")
+    except OSError as e:
+        logger.debug("RPC listener socket error: %s", e, exc_info=True)
     finally:
         if conn:
             try:
                 conn.close()
-            except OSError:
-                pass
+            except OSError as e:
+                logger.debug("RPC conn close error: %s", e)
 
 
 # ---------------------------------------------------------------------------
@@ -394,12 +395,13 @@ def execute_code(
     tool_call_log: list = []
     tool_call_counter = [0]  # mutable so the RPC thread can increment
     exec_start = time.monotonic()
+    server_sock = None
 
     try:
         # Write the auto-generated hermes_tools module
-        tools_src = generate_hermes_tools_module(
-            list(sandbox_tools) if enabled_tools else list(SANDBOX_ALLOWED_TOOLS)
-        )
+        # sandbox_tools is already the correct set (intersection with session
+        # tools, or SANDBOX_ALLOWED_TOOLS as fallback — see lines above).
+        tools_src = generate_hermes_tools_module(list(sandbox_tools))
         with open(os.path.join(tmpdir, "hermes_tools.py"), "w") as f:
             f.write(tools_src)
 
@@ -426,19 +428,37 @@ def execute_code(
         # Build a minimal environment for the child. We intentionally exclude
         # API keys and tokens to prevent credential exfiltration from LLM-
         # generated scripts. The child accesses tools via RPC, not direct API.
+        # Exception: env vars declared by loaded skills (via env_passthrough
+        # registry) or explicitly allowed by the user in config.yaml
+        # (terminal.env_passthrough) are passed through.
         _SAFE_ENV_PREFIXES = ("PATH", "HOME", "USER", "LANG", "LC_", "TERM",
                               "TMPDIR", "TMP", "TEMP", "SHELL", "LOGNAME",
                               "XDG_", "PYTHONPATH", "VIRTUAL_ENV", "CONDA")
         _SECRET_SUBSTRINGS = ("KEY", "TOKEN", "SECRET", "PASSWORD", "CREDENTIAL",
                               "PASSWD", "AUTH")
+        try:
+            from tools.env_passthrough import is_env_passthrough as _is_passthrough
+        except Exception:
+            _is_passthrough = lambda _: False  # noqa: E731
         child_env = {}
         for k, v in os.environ.items():
+            # Passthrough vars (skill-declared or user-configured) always pass.
+            if _is_passthrough(k):
+                child_env[k] = v
+                continue
+            # Block vars with secret-like names.
             if any(s in k.upper() for s in _SECRET_SUBSTRINGS):
                 continue
+            # Allow vars with known safe prefixes.
             if any(k.startswith(p) for p in _SAFE_ENV_PREFIXES):
                 child_env[k] = v
         child_env["HERMES_RPC_SOCKET"] = sock_path
         child_env["PYTHONDONTWRITEBYTECODE"] = "1"
+        # Ensure the hermes-agent root is importable in the sandbox so
+        # repo-root modules are available to child scripts.
+        _hermes_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        _existing_pp = child_env.get("PYTHONPATH", "")
+        child_env["PYTHONPATH"] = _hermes_root + (os.pathsep + _existing_pp if _existing_pp else "")
         # Inject user's configured timezone so datetime.now() in sandboxed
         # code reflects the correct wall-clock time.
         _tz_name = os.getenv("HERMES_TIMEZONE", "").strip()
@@ -457,11 +477,17 @@ def execute_code(
 
         # --- Poll loop: watch for exit, timeout, and interrupt ---
         deadline = time.monotonic() + timeout
-        stdout_chunks: list = []
         stderr_chunks: list = []
 
-        # Background readers to avoid pipe buffer deadlocks
+        # Background readers to avoid pipe buffer deadlocks.
+        # For stdout we use a head+tail strategy: keep the first HEAD_BYTES
+        # and a rolling window of the last TAIL_BYTES so the final print()
+        # output is never lost.  Stderr keeps head-only (errors appear early).
+        _STDOUT_HEAD_BYTES = int(MAX_STDOUT_BYTES * 0.4)   # 40% head
+        _STDOUT_TAIL_BYTES = MAX_STDOUT_BYTES - _STDOUT_HEAD_BYTES  # 60% tail
+
         def _drain(pipe, chunks, max_bytes):
+            """Simple head-only drain (used for stderr)."""
             total = 0
             try:
                 while True:
@@ -472,11 +498,51 @@ def execute_code(
                         keep = max_bytes - total
                         chunks.append(data[:keep])
                     total += len(data)
+            except (ValueError, OSError) as e:
+                logger.debug("Error reading process output: %s", e, exc_info=True)
+
+        stdout_total_bytes = [0]  # mutable ref for total bytes seen
+
+        def _drain_head_tail(pipe, head_chunks, tail_chunks, head_bytes, tail_bytes, total_ref):
+            """Drain stdout keeping both head and tail data."""
+            head_collected = 0
+            from collections import deque
+            tail_buf = deque()
+            tail_collected = 0
+            try:
+                while True:
+                    data = pipe.read(4096)
+                    if not data:
+                        break
+                    total_ref[0] += len(data)
+                    # Fill head buffer first
+                    if head_collected < head_bytes:
+                        keep = min(len(data), head_bytes - head_collected)
+                        head_chunks.append(data[:keep])
+                        head_collected += keep
+                        data = data[keep:]  # remaining goes to tail
+                        if not data:
+                            continue
+                    # Everything past head goes into rolling tail buffer
+                    tail_buf.append(data)
+                    tail_collected += len(data)
+                    # Evict old tail data to stay within tail_bytes budget
+                    while tail_collected > tail_bytes and tail_buf:
+                        oldest = tail_buf.popleft()
+                        tail_collected -= len(oldest)
             except (ValueError, OSError):
                 pass
+            # Transfer final tail to output list
+            tail_chunks.extend(tail_buf)
+
+        stdout_head_chunks: list = []
+        stdout_tail_chunks: list = []
 
         stdout_reader = threading.Thread(
-            target=_drain, args=(proc.stdout, stdout_chunks, MAX_STDOUT_BYTES), daemon=True
+            target=_drain_head_tail,
+            args=(proc.stdout, stdout_head_chunks, stdout_tail_chunks,
+                  _STDOUT_HEAD_BYTES, _STDOUT_TAIL_BYTES, stdout_total_bytes),
+            daemon=True
         )
         stderr_reader = threading.Thread(
             target=_drain, args=(proc.stderr, stderr_chunks, MAX_STDERR_BYTES), daemon=True
@@ -500,19 +566,43 @@ def execute_code(
         stdout_reader.join(timeout=3)
         stderr_reader.join(timeout=3)
 
-        stdout_text = b"".join(stdout_chunks).decode("utf-8", errors="replace")
+        stdout_head = b"".join(stdout_head_chunks).decode("utf-8", errors="replace")
+        stdout_tail = b"".join(stdout_tail_chunks).decode("utf-8", errors="replace")
         stderr_text = b"".join(stderr_chunks).decode("utf-8", errors="replace")
 
-        # Truncation notice
-        if len(stdout_text) >= MAX_STDOUT_BYTES:
-            stdout_text = stdout_text[:MAX_STDOUT_BYTES] + "\n[output truncated at 50KB]"
+        # Assemble stdout with head+tail truncation
+        total_stdout = stdout_total_bytes[0]
+        if total_stdout > MAX_STDOUT_BYTES and stdout_tail:
+            omitted = total_stdout - len(stdout_head) - len(stdout_tail)
+            truncated_notice = (
+                f"\n\n... [OUTPUT TRUNCATED - {omitted:,} chars omitted "
+                f"out of {total_stdout:,} total] ...\n\n"
+            )
+            stdout_text = stdout_head + truncated_notice + stdout_tail
+        else:
+            stdout_text = stdout_head + stdout_tail
 
         exit_code = proc.returncode if proc.returncode is not None else -1
         duration = round(time.monotonic() - exec_start, 2)
 
         # Wait for RPC thread to finish
-        server_sock.close()
+        server_sock.close()  # break accept() so thread exits promptly
+        server_sock = None  # prevent double close in finally
         rpc_thread.join(timeout=3)
+
+        # Strip ANSI escape sequences so the model never sees terminal
+        # formatting — prevents it from copying escapes into file writes.
+        from tools.ansi_strip import strip_ansi
+        stdout_text = strip_ansi(stdout_text)
+        stderr_text = strip_ansi(stderr_text)
+
+        # Redact secrets (API keys, tokens, etc.) from sandbox output.
+        # The sandbox env-var filter (lines 434-454) blocks os.environ access,
+        # but scripts can still read secrets from disk (e.g. open('~/.hermes/.env')).
+        # This ensures leaked secrets never enter the model context.
+        from agent.redact import redact_sensitive_text
+        stdout_text = redact_sensitive_text(stdout_text)
+        stderr_text = redact_sensitive_text(stderr_text)
 
         # Build response
         result: Dict[str, Any] = {
@@ -537,7 +627,14 @@ def execute_code(
 
     except Exception as exc:
         duration = round(time.monotonic() - exec_start, 2)
-        logging.exception("execute_code failed")
+        logger.error(
+            "execute_code failed after %ss with %d tool calls: %s: %s",
+            duration,
+            tool_call_counter[0],
+            type(exc).__name__,
+            exc,
+            exc_info=True,
+        )
         return json.dumps({
             "status": "error",
             "error": str(exc),
@@ -547,15 +644,17 @@ def execute_code(
 
     finally:
         # Cleanup temp dir and socket
-        try:
-            import shutil
-            shutil.rmtree(tmpdir, ignore_errors=True)
-        except Exception as e:
-            logger.debug("Could not clean temp dir: %s", e)
+        if server_sock is not None:
+            try:
+                server_sock.close()
+            except OSError as e:
+                logger.debug("Server socket close error: %s", e)
+        import shutil
+        shutil.rmtree(tmpdir, ignore_errors=True)
         try:
             os.unlink(sock_path)
         except OSError:
-            pass
+            pass  # already cleaned up or never created
 
 
 def _kill_process_group(proc, escalate: bool = False):
@@ -565,11 +664,12 @@ def _kill_process_group(proc, escalate: bool = False):
             proc.terminate()
         else:
             os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
-    except (ProcessLookupError, PermissionError):
+    except (ProcessLookupError, PermissionError) as e:
+        logger.debug("Could not kill process group: %s", e, exc_info=True)
         try:
             proc.kill()
-        except Exception as e:
-            logger.debug("Could not kill process: %s", e)
+        except Exception as e2:
+            logger.debug("Could not kill process: %s", e2, exc_info=True)
 
     if escalate:
         # Give the process 5s to exit after SIGTERM, then SIGKILL
@@ -581,11 +681,12 @@ def _kill_process_group(proc, escalate: bool = False):
                     proc.kill()
                 else:
                     os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
-            except (ProcessLookupError, PermissionError):
+            except (ProcessLookupError, PermissionError) as e:
+                logger.debug("Could not kill process group with SIGKILL: %s", e, exc_info=True)
                 try:
                     proc.kill()
-                except Exception as e:
-                    logger.debug("Could not kill process: %s", e)
+                except Exception as e2:
+                    logger.debug("Could not kill process: %s", e2, exc_info=True)
 
 
 def _load_config() -> dict:
@@ -647,7 +748,10 @@ def build_execute_code_schema(enabled_sandbox_tools: set = None) -> dict:
     import_examples = [n for n in ("web_search", "terminal") if n in enabled_sandbox_tools]
     if not import_examples:
         import_examples = sorted(enabled_sandbox_tools)[:2]
-    import_str = ", ".join(import_examples) + ", ..."
+    if import_examples:
+        import_str = ", ".join(import_examples) + ", ..."
+    else:
+        import_str = "..."
 
     description = (
         "Run a Python script that can call Hermes tools programmatically. "
@@ -661,7 +765,8 @@ def build_execute_code_schema(enabled_sandbox_tools: set = None) -> dict:
         f"Available via `from hermes_tools import ...`:\n\n"
         f"{tool_lines}\n\n"
         "Limits: 5-minute timeout, 50KB stdout cap, max 50 tool calls per script. "
-        "terminal() is foreground-only (no background or pty).\n\n"
+        "terminal() is foreground-only (no background or pty). "
+        "If the session uses a cloud sandbox backend, treat it as resumable task state rather than a durable always-on machine.\n\n"
         "Print your final result to stdout. Use Python stdlib (json, re, math, csv, "
         "datetime, collections, etc.) for processing between tool calls.\n\n"
         "Also available (no import needed — built into hermes_tools):\n"
@@ -706,4 +811,5 @@ registry.register(
         task_id=kw.get("task_id"),
         enabled_tools=kw.get("enabled_tools")),
     check_fn=check_sandbox_requirements,
+    emoji="🐍",
 )

@@ -6,13 +6,10 @@ description: "Set up Hermes Agent as a WhatsApp bot via the built-in Baileys bri
 
 # WhatsApp Setup
 
-Hermes connects to WhatsApp through a built-in bridge using [whatsapp-web.js](https://github.com/pedroslopez/whatsapp-web.js)
-(Baileys-based). This works by emulating a WhatsApp Web session — **not** through the official
-WhatsApp Business API. No Meta developer account or Business verification is required.
+Hermes connects to WhatsApp through a built-in bridge based on **Baileys**. This works by emulating a WhatsApp Web session — **not** through the official WhatsApp Business API. No Meta developer account or Business verification is required.
 
 :::warning Unofficial API — Ban Risk
-WhatsApp does **not** officially support third-party bots outside the Business API. Using
-whatsapp-web.js carries a small risk of account restrictions. To minimize risk:
+WhatsApp does **not** officially support third-party bots outside the Business API. Using a third-party bridge carries a small risk of account restrictions. To minimize risk:
 - **Use a dedicated phone number** for the bot (not your personal number)
 - **Don't send bulk/spam messages** — keep usage conversational
 - **Don't automate outbound messaging** to people who haven't messaged first
@@ -20,7 +17,7 @@ whatsapp-web.js carries a small risk of account restrictions. To minimize risk:
 
 :::warning WhatsApp Web Protocol Updates
 WhatsApp periodically updates their Web protocol, which can temporarily break compatibility
-with whatsapp-web.js. When this happens, Hermes will update the bridge dependency. If the
+with third-party bridges. When this happens, Hermes will update the bridge dependency. If the
 bot stops working after a WhatsApp update, pull the latest Hermes version and re-pair.
 :::
 
@@ -38,21 +35,7 @@ bot stops working after a WhatsApp update, pull the latest Hermes version and re
 - **Node.js v18+** and **npm** — the WhatsApp bridge runs as a Node.js process
 - **A phone with WhatsApp** installed (for scanning the QR code)
 
-**On Linux headless servers**, you also need Chromium/Puppeteer dependencies:
-
-```bash
-# Debian / Ubuntu
-sudo apt-get install -y \
-  libnss3 libatk1.0-0 libatk-bridge2.0-0 libcups2 libdrm2 \
-  libxkbcommon0 libxcomposite1 libxdamage1 libxrandr2 libgbm1 \
-  libpango-1.0-0 libcairo2 libasound2 libxshmfence1
-
-# Fedora / RHEL
-sudo dnf install -y \
-  nss atk at-spi2-atk cups-libs libdrm libxkbcommon \
-  libXcomposite libXdamage libXrandr mesa-libgbm \
-  pango cairo alsa-lib
-```
+Unlike older browser-driven bridges, the current Baileys-based bridge does **not** require a local Chromium or Puppeteer dependency stack.
 
 ---
 
@@ -111,17 +94,38 @@ Add the following to your `~/.hermes/.env` file:
 # Required
 WHATSAPP_ENABLED=true
 WHATSAPP_MODE=bot                          # "bot" or "self-chat"
-WHATSAPP_ALLOWED_USERS=15551234567         # Comma-separated phone numbers (with country code, no +)
 
-# Optional
-WHATSAPP_HOME_CONTACT=15551234567          # Default contact for proactive/scheduled messages
+# Access control — pick ONE of these options:
+WHATSAPP_ALLOWED_USERS=15551234567         # Comma-separated phone numbers (with country code, no +)
+# WHATSAPP_ALLOWED_USERS=*                 # OR use * to allow everyone
+# WHATSAPP_ALLOW_ALL_USERS=true            # OR set this flag instead (same effect as *)
 ```
+
+:::tip Allow-all shorthand
+Setting `WHATSAPP_ALLOWED_USERS=*` allows **all** senders (equivalent to `WHATSAPP_ALLOW_ALL_USERS=true`).
+This is consistent with [Signal group allowlists](/docs/reference/environment-variables).
+To use the pairing flow instead, remove both variables and rely on the
+[DM pairing system](/docs/user-guide/security#dm-pairing-system).
+:::
+
+Optional behavior settings in `~/.hermes/config.yaml`:
+
+```yaml
+unauthorized_dm_behavior: pair
+
+whatsapp:
+  unauthorized_dm_behavior: ignore
+```
+
+- `unauthorized_dm_behavior: pair` is the global default. Unknown DM senders get a pairing code.
+- `whatsapp.unauthorized_dm_behavior: ignore` makes WhatsApp stay silent for unauthorized DMs, which is usually the better choice for a private number.
 
 Then start the gateway:
 
 ```bash
 hermes gateway              # Foreground
-hermes gateway install      # Install as a system service
+hermes gateway install      # Install as a user service
+sudo hermes gateway install --system   # Linux only: boot-time system service
 ```
 
 The gateway starts the WhatsApp bridge automatically using the saved session.
@@ -130,12 +134,11 @@ The gateway starts the WhatsApp bridge automatically using the saved session.
 
 ## Session Persistence
 
-The whatsapp-web.js `LocalAuth` strategy saves your session to the `.wwebjs_auth` folder inside
-your Hermes data directory (`~/.hermes/`). This means:
+The Baileys bridge saves its session under `~/.hermes/whatsapp/session`. This means:
 
 - **Sessions survive restarts** — you don't need to re-scan the QR code every time
 - The session data includes encryption keys and device credentials
-- **Do not share or commit the `.wwebjs_auth` folder** — it grants full access to the WhatsApp account
+- **Do not share or commit this session directory** — it grants full access to the WhatsApp account
 
 ---
 
@@ -158,9 +161,16 @@ with reconnection logic.
 
 Hermes supports voice on WhatsApp:
 
-- **Incoming:** Voice messages (`.ogg` opus) are automatically transcribed using Whisper (requires `VOICE_TOOLS_OPENAI_KEY`)
+- **Incoming:** Voice messages (`.ogg` opus) are automatically transcribed using the configured STT provider: local `faster-whisper`, Groq Whisper (`GROQ_API_KEY`), or OpenAI Whisper (`VOICE_TOOLS_OPENAI_KEY`)
 - **Outgoing:** TTS responses are sent as MP3 audio file attachments
-- Agent responses are prefixed with "⚕ **Hermes Agent**" for easy identification
+- Agent responses are prefixed with "⚕ **Hermes Agent**" by default. You can customize or disable this in `config.yaml`:
+
+```yaml
+# ~/.hermes/config.yaml
+whatsapp:
+  reply_prefix: ""                          # Empty string disables the header
+  # reply_prefix: "🤖 *My Bot*\n──────\n"  # Custom prefix (supports \n for newlines)
+```
 
 ---
 
@@ -170,24 +180,34 @@ Hermes supports voice on WhatsApp:
 |---------|----------|
 | **QR code not scanning** | Ensure terminal is wide enough (60+ columns). Try a different terminal. Make sure you're scanning from the correct WhatsApp account (bot number, not personal). |
 | **QR code expires** | QR codes refresh every ~20 seconds. If it times out, restart `hermes whatsapp`. |
-| **Session not persisting** | Check that `~/.hermes/.wwebjs_auth/` exists and is writable. On Docker, mount this as a volume. |
-| **Logged out unexpectedly** | WhatsApp unlinks devices after ~14 days of phone inactivity. Keep the phone on and connected to WiFi. Re-pair with `hermes whatsapp`. |
-| **"Execution context was destroyed"** | Chromium crashed. Install the Puppeteer dependencies listed in Prerequisites. On low-RAM servers, add swap space. |
+| **Session not persisting** | Check that `~/.hermes/whatsapp/session` exists and is writable. If containerized, mount it as a persistent volume. |
+| **Logged out unexpectedly** | WhatsApp unlinks devices after long inactivity. Keep the phone on and connected to the network, then re-pair with `hermes whatsapp` if needed. |
+| **Bridge crashes or reconnect loops** | Restart the gateway, update Hermes, and re-pair if the session was invalidated by a WhatsApp protocol change. |
 | **Bot stops working after WhatsApp update** | Update Hermes to get the latest bridge version, then re-pair. |
-| **Messages not being received** | Verify `WHATSAPP_ALLOWED_USERS` includes the sender's number (with country code, no `+` or spaces). |
+| **macOS: "Node.js not installed" but node works in terminal** | launchd services don't inherit your shell PATH. Run `hermes gateway install` to re-snapshot your current PATH into the plist, then `hermes gateway start`. See the [Gateway Service docs](./index.md#macos-launchd) for details. |
+| **Messages not being received** | Verify `WHATSAPP_ALLOWED_USERS` includes the sender's number (with country code, no `+` or spaces), or set it to `*` to allow everyone. Set `WHATSAPP_DEBUG=true` in `.env` and restart the gateway to see raw message events in `bridge.log`. |
+| **Bot replies to strangers with a pairing code** | Set `whatsapp.unauthorized_dm_behavior: ignore` in `~/.hermes/config.yaml` if you want unauthorized DMs to be silently ignored instead. |
 
 ---
 
 ## Security
 
 :::warning
-**Always set `WHATSAPP_ALLOWED_USERS`** with phone numbers (including country code, without the `+`)
-of authorized users. Without this setting, the gateway will **deny all incoming messages** as a
-safety measure.
+**Configure access control** before going live. Set `WHATSAPP_ALLOWED_USERS` with specific
+phone numbers (including country code, without the `+`), use `*` to allow everyone, or set
+`WHATSAPP_ALLOW_ALL_USERS=true`. Without any of these, the gateway **denies all incoming
+messages** as a safety measure.
 :::
 
-- The `.wwebjs_auth` folder contains full session credentials — protect it like a password
-- Set file permissions: `chmod 700 ~/.hermes/.wwebjs_auth`
+By default, unauthorized DMs still receive a pairing code reply. If you want a private WhatsApp number to stay completely silent to strangers, set:
+
+```yaml
+whatsapp:
+  unauthorized_dm_behavior: ignore
+```
+
+- The `~/.hermes/whatsapp/session` directory contains full session credentials — protect it like a password
+- Set file permissions: `chmod 700 ~/.hermes/whatsapp/session`
 - Use a **dedicated phone number** for the bot to isolate risk from your personal account
 - If you suspect compromise, unlink the device from WhatsApp → Settings → Linked Devices
 - Phone numbers in logs are partially redacted, but review your log retention policy

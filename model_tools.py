@@ -22,8 +22,8 @@ Public API (signatures preserved from the original 2,400-line version):
 
 import json
 import asyncio
-import os
 import logging
+import threading
 from typing import Dict, Any, List, Optional, Tuple
 
 from tools.registry import registry
@@ -36,6 +36,48 @@ logger = logging.getLogger(__name__)
 # Async Bridging  (single source of truth -- used by registry.dispatch too)
 # =============================================================================
 
+_tool_loop = None          # persistent loop for the main (CLI) thread
+_tool_loop_lock = threading.Lock()
+_worker_thread_local = threading.local()  # per-worker-thread persistent loops
+
+
+def _get_tool_loop():
+    """Return a long-lived event loop for running async tool handlers.
+
+    Using a persistent loop (instead of asyncio.run() which creates and
+    *closes* a fresh loop every time) prevents "Event loop is closed"
+    errors that occur when cached httpx/AsyncOpenAI clients attempt to
+    close their transport on a dead loop during garbage collection.
+    """
+    global _tool_loop
+    with _tool_loop_lock:
+        if _tool_loop is None or _tool_loop.is_closed():
+            _tool_loop = asyncio.new_event_loop()
+        return _tool_loop
+
+
+def _get_worker_loop():
+    """Return a persistent event loop for the current worker thread.
+
+    Each worker thread (e.g., delegate_task's ThreadPoolExecutor threads)
+    gets its own long-lived loop stored in thread-local storage.  This
+    prevents the "Event loop is closed" errors that occurred when
+    asyncio.run() was used per-call: asyncio.run() creates a loop, runs
+    the coroutine, then *closes* the loop — but cached httpx/AsyncOpenAI
+    clients remain bound to that now-dead loop and raise RuntimeError
+    during garbage collection or subsequent use.
+
+    By keeping the loop alive for the thread's lifetime, cached clients
+    stay valid and their cleanup runs on a live loop.
+    """
+    loop = getattr(_worker_thread_local, 'loop', None)
+    if loop is None or loop.is_closed():
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        _worker_thread_local.loop = loop
+    return loop
+
+
 def _run_async(coro):
     """Run an async coroutine from a sync context.
 
@@ -43,6 +85,15 @@ def _run_async(coro):
     the gateway's async stack or Atropos's event loop), we spin up a
     disposable thread so asyncio.run() can create its own loop without
     conflicting.
+
+    For the common CLI path (no running loop), we use a persistent event
+    loop so that cached async clients (httpx / AsyncOpenAI) remain bound
+    to a live loop and don't trigger "Event loop is closed" on GC.
+
+    When called from a worker thread (parallel tool execution), we use a
+    per-thread persistent loop to avoid both contention with the main
+    thread's shared loop AND the "Event loop is closed" errors caused by
+    asyncio.run()'s create-and-destroy lifecycle.
 
     This is the single source of truth for sync->async bridging in tool
     handlers. The RL paths (agent_loop.py, tool_context.py) also provide
@@ -55,11 +106,23 @@ def _run_async(coro):
         loop = None
 
     if loop and loop.is_running():
+        # Inside an async context (gateway, RL env) — run in a fresh thread.
         import concurrent.futures
         with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
             future = pool.submit(asyncio.run, coro)
             return future.result(timeout=300)
-    return asyncio.run(coro)
+
+    # If we're on a worker thread (e.g., parallel tool execution in
+    # delegate_task), use a per-thread persistent loop.  This avoids
+    # contention with the main thread's shared loop while keeping cached
+    # httpx/AsyncOpenAI clients bound to a live loop for the thread's
+    # lifetime — preventing "Event loop is closed" on GC cleanup.
+    if threading.current_thread() is not threading.main_thread():
+        worker_loop = _get_worker_loop()
+        return worker_loop.run_until_complete(coro)
+
+    tool_loop = _get_tool_loop()
+    return tool_loop.run_until_complete(coro)
 
 
 # =============================================================================
@@ -93,7 +156,7 @@ def _discover_tools():
         "tools.delegate_tool",
         "tools.process_registry",
         "tools.send_message_tool",
-        "tools.honcho_tools",
+        # "tools.honcho_tools",  # Removed — Honcho is now a memory provider plugin
         "tools.homeassistant_tool",
     ]
     import importlib
@@ -101,7 +164,7 @@ def _discover_tools():
         try:
             importlib.import_module(mod_name)
         except Exception as e:
-            logger.debug("Could not import %s: %s", mod_name, e)
+            logger.warning("Could not import tool module %s: %s", mod_name, e)
 
 
 _discover_tools()
@@ -112,6 +175,13 @@ try:
     discover_mcp_tools()
 except Exception as e:
     logger.debug("MCP tool discovery failed: %s", e)
+
+# Plugin tool discovery (user/project/pip plugins)
+try:
+    from hermes_cli.plugins import discover_plugins
+    discover_plugins()
+except Exception as e:
+    logger.debug("Plugin discovery failed: %s", e)
 
 
 # =============================================================================
@@ -142,9 +212,9 @@ _LEGACY_TOOLSET_MAP = {
         "browser_navigate", "browser_snapshot", "browser_click",
         "browser_type", "browser_scroll", "browser_back",
         "browser_press", "browser_close", "browser_get_images",
-        "browser_vision"
+        "browser_vision", "browser_console"
     ],
-    "cronjob_tools": ["schedule_cronjob", "list_cronjobs", "remove_cronjob"],
+    "cronjob_tools": ["cronjob"],
     "rl_tools": [
         "rl_list_environments", "rl_select_environment",
         "rl_get_current_config", "rl_edit_config",
@@ -182,7 +252,7 @@ def get_tool_definitions(
     # Determine which tool names the caller wants
     tools_to_include: set = set()
 
-    if enabled_toolsets:
+    if enabled_toolsets is not None:
         for toolset_name in enabled_toolsets:
             if validate_toolset(toolset_name):
                 resolved = resolve_toolset(toolset_name)
@@ -222,20 +292,53 @@ def get_tool_definitions(
         for ts_name in get_all_toolsets():
             tools_to_include.update(resolve_toolset(ts_name))
 
+    # Plugin-registered tools are now resolved through the normal toolset
+    # path — validate_toolset() / resolve_toolset() / get_all_toolsets()
+    # all check the tool registry for plugin-provided toolsets.  No bypass
+    # needed; plugins respect enabled_toolsets / disabled_toolsets like any
+    # other toolset.
+
     # Ask the registry for schemas (only returns tools whose check_fn passes)
     filtered_tools = registry.get_definitions(tools_to_include, quiet=quiet_mode)
 
+    # The set of tool names that actually passed check_fn filtering.
+    # Use this (not tools_to_include) for any downstream schema that references
+    # other tools by name — otherwise the model sees tools mentioned in
+    # descriptions that don't actually exist, and hallucinates calls to them.
+    available_tool_names = {t["function"]["name"] for t in filtered_tools}
+
     # Rebuild execute_code schema to only list sandbox tools that are actually
-    # enabled.  Without this, the model sees "web_search is available in
-    # execute_code" even when the user disabled the web toolset (#560-discord).
-    if "execute_code" in tools_to_include:
+    # available.  Without this, the model sees "web_search is available in
+    # execute_code" even when the API key isn't configured or the toolset is
+    # disabled (#560-discord).
+    if "execute_code" in available_tool_names:
         from tools.code_execution_tool import SANDBOX_ALLOWED_TOOLS, build_execute_code_schema
-        sandbox_enabled = SANDBOX_ALLOWED_TOOLS & tools_to_include
+        sandbox_enabled = SANDBOX_ALLOWED_TOOLS & available_tool_names
         dynamic_schema = build_execute_code_schema(sandbox_enabled)
         for i, td in enumerate(filtered_tools):
             if td.get("function", {}).get("name") == "execute_code":
                 filtered_tools[i] = {"type": "function", "function": dynamic_schema}
                 break
+
+    # Strip web tool cross-references from browser_navigate description when
+    # web_search / web_extract are not available.  The static schema says
+    # "prefer web_search or web_extract" which causes the model to hallucinate
+    # those tools when they're missing.
+    if "browser_navigate" in available_tool_names:
+        web_tools_available = {"web_search", "web_extract"} & available_tool_names
+        if not web_tools_available:
+            for i, td in enumerate(filtered_tools):
+                if td.get("function", {}).get("name") == "browser_navigate":
+                    desc = td["function"].get("description", "")
+                    desc = desc.replace(
+                        " For simple information retrieval, prefer web_search or web_extract (faster, cheaper).",
+                        "",
+                    )
+                    filtered_tools[i] = {
+                        "type": "function",
+                        "function": {**td["function"], "description": desc},
+                    }
+                    break
 
     if not quiet_mode:
         if filtered_tools:
@@ -259,6 +362,7 @@ def get_tool_definitions(
 # The registry still holds their schemas; dispatch just returns a stub error
 # so if something slips through, the LLM sees a sensible message.
 _AGENT_LOOP_TOOLS = {"todo", "memory", "session_search", "delegate_task"}
+_READ_SEARCH_TOOLS = {"read_file", "search_files"}
 
 
 def handle_function_call(
@@ -266,6 +370,7 @@ def handle_function_call(
     function_args: Dict[str, Any],
     task_id: Optional[str] = None,
     user_task: Optional[str] = None,
+    enabled_tools: Optional[List[str]] = None,
 ) -> str:
     """
     Main function call dispatcher that routes calls to the tool registry.
@@ -275,26 +380,56 @@ def handle_function_call(
         function_args: Arguments for the function.
         task_id: Unique identifier for terminal/browser session isolation.
         user_task: The user's original task (for browser_snapshot context).
+        enabled_tools: Tool names enabled for this session.  When provided,
+                       execute_code uses this list to determine which sandbox
+                       tools to generate.  Falls back to the process-global
+                       ``_last_resolved_tool_names`` for backward compat.
 
     Returns:
         Function result as a JSON string.
     """
+    # Notify the read-loop tracker when a non-read/search tool runs,
+    # so the *consecutive* counter resets (reads after other work are fine).
+    if function_name not in _READ_SEARCH_TOOLS:
+        try:
+            from tools.file_tools import notify_other_tool_call
+            notify_other_tool_call(task_id or "default")
+        except Exception:
+            pass  # file_tools may not be loaded yet
+
     try:
         if function_name in _AGENT_LOOP_TOOLS:
             return json.dumps({"error": f"{function_name} must be handled by the agent loop"})
 
+        try:
+            from hermes_cli.plugins import invoke_hook
+            invoke_hook("pre_tool_call", tool_name=function_name, args=function_args, task_id=task_id or "")
+        except Exception:
+            pass
+
         if function_name == "execute_code":
-            return registry.dispatch(
+            # Prefer the caller-provided list so subagents can't overwrite
+            # the parent's tool set via the process-global.
+            sandbox_enabled = enabled_tools if enabled_tools is not None else _last_resolved_tool_names
+            result = registry.dispatch(
                 function_name, function_args,
                 task_id=task_id,
-                enabled_tools=_last_resolved_tool_names,
+                enabled_tools=sandbox_enabled,
+            )
+        else:
+            result = registry.dispatch(
+                function_name, function_args,
+                task_id=task_id,
+                user_task=user_task,
             )
 
-        return registry.dispatch(
-            function_name, function_args,
-            task_id=task_id,
-            user_task=user_task,
-        )
+        try:
+            from hermes_cli.plugins import invoke_hook
+            invoke_hook("post_tool_call", tool_name=function_name, args=function_args, result=result, task_id=task_id or "")
+        except Exception:
+            pass
+
+        return result
 
     except Exception as e:
         error_msg = f"Error executing {function_name}: {str(e)}"

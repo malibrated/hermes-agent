@@ -118,6 +118,23 @@ class TerminalBench2EvalConfig(HermesAgentEnvConfig):
         "Tasks exceeding this are scored as FAIL. Default 30 minutes.",
     )
 
+    # --- Concurrency control ---
+    max_concurrent_tasks: int = Field(
+        default=8,
+        description="Maximum number of tasks to run concurrently. "
+        "Limits concurrent Modal sandbox creations to avoid async/threading deadlocks. "
+        "Modal has internal limits and creating too many sandboxes simultaneously "
+        "causes blocking calls to deadlock inside the thread pool.",
+    )
+
+    # --- Eval concurrency ---
+    eval_concurrency: int = Field(
+        default=0,
+        description="Maximum number of tasks to evaluate in parallel. "
+        "0 means unlimited (all tasks run concurrently). "
+        "Set to 8 for local backends to avoid overwhelming the machine.",
+    )
+
 
 # Tasks that cannot run properly on Modal and are excluded from scoring.
 MODAL_INCOMPATIBLE_TASKS = {
@@ -429,8 +446,14 @@ class TerminalBench2EvalEnv(HermesAgentBaseEnv):
                     "error": "no_image",
                 }
 
-            # --- 2. Register per-task Modal image override ---
-            register_task_env_overrides(task_id, {"modal_image": modal_image})
+            # --- 2. Register per-task image override ---
+            # Set both modal_image and docker_image so the task image is used
+            # regardless of which backend is configured.
+            register_task_env_overrides(task_id, {
+                "modal_image": modal_image,
+                "docker_image": modal_image,
+                "cwd": "/app",
+            })
             logger.info(
                 "Task %s: registered image override for task_id %s",
                 task_name, task_id[:8],
@@ -445,17 +468,37 @@ class TerminalBench2EvalEnv(HermesAgentBaseEnv):
             messages.append({"role": "user", "content": self.format_prompt(eval_item)})
 
             # --- 4. Run agent loop ---
-            agent = HermesAgentLoop(
-                server=self.server,
-                tool_schemas=tools,
-                valid_tool_names=valid_names,
-                max_turns=self.config.max_agent_turns,
-                task_id=task_id,
-                temperature=self.config.agent_temperature,
-                max_tokens=self.config.max_token_length,
-                extra_body=self.config.extra_body,
-            )
-            result = await agent.run(messages)
+            # Use ManagedServer (Phase 2) for vLLM/SGLang backends to get
+            # token-level tracking via /generate. Falls back to direct
+            # ServerManager (Phase 1) for OpenAI endpoints.
+            if self._use_managed_server():
+                async with self.server.managed_server(
+                    tokenizer=self.tokenizer,
+                    preserve_think_blocks=bool(self.config.thinking_mode),
+                ) as managed:
+                    agent = HermesAgentLoop(
+                        server=managed,
+                        tool_schemas=tools,
+                        valid_tool_names=valid_names,
+                        max_turns=self.config.max_agent_turns,
+                        task_id=task_id,
+                        temperature=self.config.agent_temperature,
+                        max_tokens=self.config.max_token_length,
+                        extra_body=self.config.extra_body,
+                    )
+                    result = await agent.run(messages)
+            else:
+                agent = HermesAgentLoop(
+                    server=self.server,
+                    tool_schemas=tools,
+                    valid_tool_names=valid_names,
+                    max_turns=self.config.max_agent_turns,
+                    task_id=task_id,
+                    temperature=self.config.agent_temperature,
+                    max_tokens=self.config.max_token_length,
+                    extra_body=self.config.extra_body,
+                )
+                result = await agent.run(messages)
 
             # --- 5. Verify -- run test suite in the agent's sandbox ---
             # Skip verification if the agent produced no meaningful output
@@ -733,12 +776,23 @@ class TerminalBench2EvalEnv(HermesAgentBaseEnv):
         print(f"  Tool thread pool: {self.config.tool_pool_size}")
         print(f"  Terminal timeout: {self.config.terminal_timeout}s/cmd")
         print(f"  Terminal lifetime: {self.config.terminal_lifetime}s (auto: task_timeout + 120)")
+        print(f"  Max concurrent tasks: {self.config.max_concurrent_tasks}")
         print(f"{'='*60}\n")
+
+        # Semaphore to limit concurrent Modal sandbox creations.
+        # Without this, all 86 tasks fire simultaneously, each creating a Modal
+        # sandbox via asyncio.run() inside a thread pool worker. Modal's blocking
+        # calls (App.lookup, etc.) deadlock when too many are created at once.
+        semaphore = asyncio.Semaphore(self.config.max_concurrent_tasks)
+
+        async def _eval_with_semaphore(item):
+            async with semaphore:
+                return await self._eval_with_timeout(item)
 
         # Fire all tasks with wall-clock timeout, track live accuracy on the bar
         total_tasks = len(self.all_eval_items)
         eval_tasks = [
-            asyncio.ensure_future(self._eval_with_timeout(item))
+            asyncio.ensure_future(_eval_with_semaphore(item))
             for item in self.all_eval_items
         ]
 

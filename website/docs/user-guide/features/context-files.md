@@ -1,21 +1,27 @@
 ---
 sidebar_position: 8
 title: "Context Files"
-description: "Project context files — AGENTS.md, SOUL.md, and .cursorrules — automatically injected into every conversation"
+description: "Project context files — .hermes.md, AGENTS.md, CLAUDE.md, global SOUL.md, and .cursorrules — automatically injected into every conversation"
 ---
 
 # Context Files
 
-Hermes Agent automatically discovers and loads project context files from your working directory. These files are injected into the system prompt at the start of every session, giving the agent persistent knowledge about your project's conventions, architecture, and preferences.
+Hermes Agent automatically discovers and loads context files that shape how it behaves. Some are project-local and discovered from your working directory. `SOUL.md` is now global to the Hermes instance and is loaded from `HERMES_HOME` only.
 
 ## Supported Context Files
 
 | File | Purpose | Discovery |
-|------|---------|-----------|
+|------|---------|-----------| 
+| **.hermes.md** / **HERMES.md** | Project instructions (highest priority) | Walks to git root |
 | **AGENTS.md** | Project instructions, conventions, architecture | Recursive (walks subdirectories) |
-| **SOUL.md** | Personality and tone customization | CWD → `~/.hermes/SOUL.md` fallback |
+| **CLAUDE.md** | Claude Code context files (also detected) | CWD only |
+| **SOUL.md** | Global personality and tone customization for this Hermes instance | `HERMES_HOME/SOUL.md` only |
 | **.cursorrules** | Cursor IDE coding conventions | CWD only |
 | **.cursor/rules/*.mdc** | Cursor IDE rule modules | CWD only |
+
+:::info Priority system
+Only **one** project context type is loaded per session (first match wins): `.hermes.md` → `AGENTS.md` → `CLAUDE.md` → `.cursorrules`. **SOUL.md** is always loaded independently as the agent identity (slot #1).
+:::
 
 ## AGENTS.md
 
@@ -71,18 +77,22 @@ This is a Next.js 14 web application with a Python FastAPI backend.
 
 `SOUL.md` controls the agent's personality, tone, and communication style. See the [Personality](/docs/user-guide/features/personality) page for full details.
 
-**Discovery order:**
+**Location:**
 
-1. `SOUL.md` or `soul.md` in the current working directory
-2. `~/.hermes/SOUL.md` (global fallback)
+- `~/.hermes/SOUL.md`
+- or `$HERMES_HOME/SOUL.md` if you run Hermes with a custom home directory
 
-When a SOUL.md is found, the agent is instructed:
+Important details:
 
-> *"If SOUL.md is present, embody its persona and tone. Avoid stiff, generic replies; follow its guidance unless higher-priority instructions override it."*
+- Hermes seeds a default `SOUL.md` automatically if one does not exist yet
+- Hermes loads `SOUL.md` only from `HERMES_HOME`
+- Hermes does not probe the working directory for `SOUL.md`
+- If the file is empty, nothing from `SOUL.md` is added to the prompt
+- If the file has content, the content is injected verbatim after scanning and truncation
 
 ## .cursorrules
 
-Hermes is compatible with Cursor IDE's `.cursorrules` file and `.cursor/rules/*.mdc` rule modules. If these files exist in your project root, they're loaded alongside AGENTS.md.
+Hermes is compatible with Cursor IDE's `.cursorrules` file and `.cursor/rules/*.mdc` rule modules. If these files exist in your project root and no higher-priority context file (`.hermes.md`, `AGENTS.md`, or `CLAUDE.md`) is found, they're loaded as the project context.
 
 This means your existing Cursor conventions automatically apply when using Hermes.
 
@@ -97,9 +107,9 @@ Context files are loaded by `build_context_files_prompt()` in `agent/prompt_buil
 5. **Assembly** — all sections are combined under a `# Project Context` header
 6. **Injection** — the assembled content is added to the system prompt
 
-The final prompt section looks like:
+The final prompt section looks roughly like:
 
-```
+```text
 # Project Context
 
 The following project context files have been loaded and should be followed:
@@ -112,12 +122,10 @@ The following project context files have been loaded and should be followed:
 
 [Your .cursorrules content here]
 
-## SOUL.md
-
-If SOUL.md is present, embody its persona and tone...
-
 [Your SOUL.md content here]
 ```
+
+Notice that SOUL content is inserted directly, without extra wrapper text.
 
 ## Security: Prompt Injection Protection
 

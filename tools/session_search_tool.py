@@ -18,17 +18,10 @@ Flow:
 import asyncio
 import concurrent.futures
 import json
-import os
 import logging
 from typing import Dict, Any, List, Optional, Union
 
-from openai import AsyncOpenAI, OpenAI
-
-from agent.auxiliary_client import get_async_text_auxiliary_client
-
-# Resolve the async auxiliary client at import time so we have the model slug.
-# Handles Codex Responses API adapter transparently.
-_async_aux_client, _SUMMARIZER_MODEL = get_async_text_auxiliary_client()
+from agent.auxiliary_client import async_call_llm, extract_content_or_reasoning
 MAX_SESSION_CHARS = 100_000
 MAX_SUMMARY_TOKENS = 10000
 
@@ -53,9 +46,9 @@ def _format_timestamp(ts: Union[int, float, str, None]) -> str:
             return ts
     except (ValueError, OSError, OverflowError) as e:
         # Log specific errors for debugging while gracefully handling edge cases
-        logging.debug("Failed to format timestamp %s: %s", ts, e)
+        logging.debug("Failed to format timestamp %s: %s", ts, e, exc_info=True)
     except Exception as e:
-        logging.debug("Unexpected error formatting timestamp %s: %s", ts, e)
+        logging.debug("Unexpected error formatting timestamp %s: %s", ts, e, exc_info=True)
     return str(ts)
 
 
@@ -156,32 +149,99 @@ async def _summarize_session(
         f"Summarize this conversation with focus on: {query}"
     )
 
-    if _async_aux_client is None or _SUMMARIZER_MODEL is None:
-        logging.warning("No auxiliary model available for session summarization")
-        return None
-
     max_retries = 3
     for attempt in range(max_retries):
         try:
-            from agent.auxiliary_client import get_auxiliary_extra_body, auxiliary_max_tokens_param
-            _extra = get_auxiliary_extra_body()
-            response = await _async_aux_client.chat.completions.create(
-                model=_SUMMARIZER_MODEL,
+            response = await async_call_llm(
+                task="session_search",
                 messages=[
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": user_prompt},
                 ],
-                **({} if not _extra else {"extra_body": _extra}),
                 temperature=0.1,
-                **auxiliary_max_tokens_param(MAX_SUMMARY_TOKENS),
+                max_tokens=MAX_SUMMARY_TOKENS,
             )
-            return response.choices[0].message.content.strip()
+            content = extract_content_or_reasoning(response)
+            if content:
+                return content
+            # Reasoning-only / empty — let the retry loop handle it
+            logging.warning("Session search LLM returned empty content (attempt %d/%d)", attempt + 1, max_retries)
+            if attempt < max_retries - 1:
+                await asyncio.sleep(1 * (attempt + 1))
+                continue
+            return content
+        except RuntimeError:
+            logging.warning("No auxiliary model available for session summarization")
+            return None
         except Exception as e:
             if attempt < max_retries - 1:
                 await asyncio.sleep(1 * (attempt + 1))
             else:
-                logging.warning(f"Session summarization failed after {max_retries} attempts: {e}")
+                logging.warning(
+                    "Session summarization failed after %d attempts: %s",
+                    max_retries,
+                    e,
+                    exc_info=True,
+                )
                 return None
+
+
+# Sources that are excluded from session browsing/searching by default.
+# Third-party integrations (Paperclip agents, etc.) tag their sessions with
+# HERMES_SESSION_SOURCE=tool so they don't clutter the user's session history.
+_HIDDEN_SESSION_SOURCES = ("tool",)
+
+
+def _list_recent_sessions(db, limit: int, current_session_id: str = None) -> str:
+    """Return metadata for the most recent sessions (no LLM calls)."""
+    try:
+        sessions = db.list_sessions_rich(limit=limit + 5, exclude_sources=list(_HIDDEN_SESSION_SOURCES))  # fetch extra to skip current
+
+        # Resolve current session lineage to exclude it
+        current_root = None
+        if current_session_id:
+            try:
+                sid = current_session_id
+                visited = set()
+                while sid and sid not in visited:
+                    visited.add(sid)
+                    s = db.get_session(sid)
+                    parent = s.get("parent_session_id") if s else None
+                    sid = parent if parent else None
+                current_root = max(visited, key=len) if visited else current_session_id
+            except Exception:
+                current_root = current_session_id
+
+        results = []
+        for s in sessions:
+            sid = s.get("id", "")
+            if current_root and (sid == current_root or sid == current_session_id):
+                continue
+            # Skip child/delegation sessions (they have parent_session_id)
+            if s.get("parent_session_id"):
+                continue
+            results.append({
+                "session_id": sid,
+                "title": s.get("title") or None,
+                "source": s.get("source", ""),
+                "started_at": s.get("started_at", ""),
+                "last_active": s.get("last_active", ""),
+                "message_count": s.get("message_count", 0),
+                "preview": s.get("preview", ""),
+            })
+            if len(results) >= limit:
+                break
+
+        return json.dumps({
+            "success": True,
+            "mode": "recent",
+            "results": results,
+            "count": len(results),
+            "message": f"Showing {len(results)} most recent sessions. Use a keyword query to search specific topics.",
+        }, ensure_ascii=False)
+    except Exception as e:
+        logging.error("Error listing recent sessions: %s", e, exc_info=True)
+        return json.dumps({"success": False, "error": f"Failed to list recent sessions: {e}"}, ensure_ascii=False)
 
 
 def session_search(
@@ -200,11 +260,14 @@ def session_search(
     if db is None:
         return json.dumps({"success": False, "error": "Session database not available."}, ensure_ascii=False)
 
+    limit = min(limit, 5)  # Cap at 5 sessions to avoid excessive LLM calls
+
+    # Recent sessions mode: when query is empty, return metadata for recent sessions.
+    # No LLM calls — just DB queries for titles, previews, timestamps.
     if not query or not query.strip():
-        return json.dumps({"success": False, "error": "Query cannot be empty."}, ensure_ascii=False)
+        return _list_recent_sessions(db, limit, current_session_id)
 
     query = query.strip()
-    limit = min(limit, 5)  # Cap at 5 sessions to avoid excessive LLM calls
 
     try:
         # Parse role filter
@@ -216,6 +279,7 @@ def session_search(
         raw_results = db.search_messages(
             query=query,
             role_filter=role_list,
+            exclude_sources=list(_HIDDEN_SESSION_SOURCES),
             limit=50,  # Get more matches to find unique sessions
             offset=0,
         )
@@ -247,17 +311,29 @@ def session_search(
                     else:
                         break
                 except Exception as e:
-                    logging.debug("Error resolving parent for session %s: %s", sid, e)
+                    logging.debug(
+                        "Error resolving parent for session %s: %s",
+                        sid,
+                        e,
+                        exc_info=True,
+                    )
                     break
             return sid
 
-        # Group by resolved (parent) session_id, dedup, skip current session
+        current_lineage_root = (
+            _resolve_to_parent(current_session_id) if current_session_id else None
+        )
+
+        # Group by resolved (parent) session_id, dedup, skip the current
+        # session lineage. Compression and delegation create child sessions
+        # that still belong to the same active conversation.
         seen_sessions = {}
         for result in raw_results:
             raw_sid = result["session_id"]
             resolved_sid = _resolve_to_parent(raw_sid)
-            # Skip the current session — the agent already has that context
-            if current_session_id and resolved_sid == current_session_id:
+            # Skip the current session lineage — the agent already has that
+            # context, even if older turns live in parent fragments.
+            if current_lineage_root and resolved_sid == current_lineage_root:
                 continue
             if current_session_id and raw_sid == current_session_id:
                 continue
@@ -280,7 +356,12 @@ def session_search(
                 conversation_text = _truncate_around_matches(conversation_text, query)
                 tasks.append((session_id, match_info, conversation_text, session_meta))
             except Exception as e:
-                logging.warning(f"Failed to prepare session {session_id}: {e}")
+                logging.warning(
+                    "Failed to prepare session %s: %s",
+                    session_id,
+                    e,
+                    exc_info=True,
+                )
 
         # Summarize all sessions in parallel
         async def _summarize_all() -> List[Union[str, Exception]]:
@@ -292,32 +373,49 @@ def session_search(
             return await asyncio.gather(*coros, return_exceptions=True)
 
         try:
-            asyncio.get_running_loop()
-            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-                results = pool.submit(lambda: asyncio.run(_summarize_all())).result(timeout=60)
-        except RuntimeError:
-            # No event loop running, create a new one
-            results = asyncio.run(_summarize_all())
+            # Use _run_async() which properly manages event loops across
+            # CLI, gateway, and worker-thread contexts.  The previous
+            # pattern (asyncio.run() in a ThreadPoolExecutor) created a
+            # disposable event loop that conflicted with cached
+            # AsyncOpenAI/httpx clients bound to a different loop,
+            # causing deadlocks in gateway mode (#2681).
+            from model_tools import _run_async
+            results = _run_async(_summarize_all())
         except concurrent.futures.TimeoutError:
-            logging.warning("Session summarization timed out after 60 seconds")
+            logging.warning(
+                "Session summarization timed out after 60 seconds",
+                exc_info=True,
+            )
             return json.dumps({
                 "success": False,
                 "error": "Session summarization timed out. Try a more specific query or reduce the limit.",
             }, ensure_ascii=False)
 
         summaries = []
-        for (session_id, match_info, _, _), result in zip(tasks, results):
+        for (session_id, match_info, conversation_text, _), result in zip(tasks, results):
             if isinstance(result, Exception):
-                logging.warning(f"Failed to summarize session {session_id}: {result}")
-                continue
+                logging.warning(
+                    "Failed to summarize session %s: %s",
+                    session_id, result, exc_info=True,
+                )
+                result = None
+
+            entry = {
+                "session_id": session_id,
+                "when": _format_timestamp(match_info.get("session_started")),
+                "source": match_info.get("source", "unknown"),
+                "model": match_info.get("model"),
+            }
+
             if result:
-                summaries.append({
-                    "session_id": session_id,
-                    "when": _format_timestamp(match_info.get("session_started")),
-                    "source": match_info.get("source", "unknown"),
-                    "model": match_info.get("model"),
-                    "summary": result,
-                })
+                entry["summary"] = result
+            else:
+                # Fallback: raw preview so matched sessions aren't silently
+                # dropped when the summarizer is unavailable (fixes #3409).
+                preview = (conversation_text[:500] + "\n…[truncated]") if conversation_text else "No preview available."
+                entry["summary"] = f"[Raw preview — summarization unavailable]\n{preview}"
+
+            summaries.append(entry)
 
         return json.dumps({
             "success": True,
@@ -328,13 +426,12 @@ def session_search(
         }, ensure_ascii=False)
 
     except Exception as e:
+        logging.error("Session search failed: %s", e, exc_info=True)
         return json.dumps({"success": False, "error": f"Search failed: {str(e)}"}, ensure_ascii=False)
 
 
 def check_session_search_requirements() -> bool:
     """Requires SQLite state database and an auxiliary text model."""
-    if _async_aux_client is None:
-        return False
     try:
         from hermes_state import DEFAULT_DB_PATH
         return DEFAULT_DB_PATH.parent.exists()
@@ -345,16 +442,22 @@ def check_session_search_requirements() -> bool:
 SESSION_SEARCH_SCHEMA = {
     "name": "session_search",
     "description": (
-        "Search your long-term memory of past conversations. This is your recall -- "
+        "Search your long-term memory of past conversations, or browse recent sessions. This is your recall -- "
         "every past session is searchable, and this tool summarizes what happened.\n\n"
+        "TWO MODES:\n"
+        "1. Recent sessions (no query): Call with no arguments to see what was worked on recently. "
+        "Returns titles, previews, and timestamps. Zero LLM cost, instant. "
+        "Start here when the user asks what were we working on or what did we do recently.\n"
+        "2. Keyword search (with query): Search for specific topics across all past sessions. "
+        "Returns LLM-generated summaries of matching sessions.\n\n"
         "USE THIS PROACTIVELY when:\n"
         "- The user says 'we did this before', 'remember when', 'last time', 'as I mentioned'\n"
         "- The user asks about a topic you worked on before but don't have in current context\n"
         "- The user references a project, person, or concept that seems familiar but isn't in memory\n"
         "- You want to check if you've solved a similar problem before\n"
         "- The user asks 'what did we do about X?' or 'how did we fix Y?'\n\n"
-        "Don't hesitate to search -- it's fast and cheap. Better to search and confirm "
-        "than to guess or ask the user to repeat themselves.\n\n"
+        "Don't hesitate to search when it is actually cross-session -- it's fast and cheap. "
+        "Better to search and confirm than to guess or ask the user to repeat themselves.\n\n"
         "Search syntax: keywords joined with OR for broad recall (elevenlabs OR baseten OR funding), "
         "phrases for exact match (\"docker networking\"), boolean (python NOT java), prefix (deploy*). "
         "IMPORTANT: Use OR between keywords for best results — FTS5 defaults to AND which misses "
@@ -366,7 +469,7 @@ SESSION_SEARCH_SCHEMA = {
         "properties": {
             "query": {
                 "type": "string",
-                "description": "Search query — keywords, phrases, or boolean expressions to find in past sessions.",
+                "description": "Search query — keywords, phrases, or boolean expressions to find in past sessions. Omit this parameter entirely to browse recent sessions instead (returns titles, previews, timestamps with no LLM cost).",
             },
             "role_filter": {
                 "type": "string",
@@ -378,7 +481,7 @@ SESSION_SEARCH_SCHEMA = {
                 "default": 3,
             },
         },
-        "required": ["query"],
+        "required": [],
     },
 }
 
@@ -391,10 +494,11 @@ registry.register(
     toolset="session_search",
     schema=SESSION_SEARCH_SCHEMA,
     handler=lambda args, **kw: session_search(
-        query=args.get("query", ""),
+        query=args.get("query") or "",
         role_filter=args.get("role_filter"),
         limit=args.get("limit", 3),
         db=kw.get("db"),
         current_session_id=kw.get("current_session_id")),
     check_fn=check_session_search_requirements,
+    emoji="🔍",
 )
