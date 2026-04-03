@@ -43,6 +43,28 @@ DEFAULT_LOCAL_MLX_EMBED_MODEL = os.getenv(
 DEFAULT_LOCAL_MLX_PORT = int(os.getenv("LOCAL_MLX_PORT", "53147"))
 DEFAULT_LOCAL_MLX_BASE_URL = f"http://127.0.0.1:{DEFAULT_LOCAL_MLX_PORT}"
 
+# TurboQuant KV cache compression
+try:
+    from agent.kv_compression import TurboQuantConfig, TurboQuantKVCache
+    TURBOQUANT_AVAILABLE = True
+except ImportError:
+    TURBOQUANT_AVAILABLE = False
+    TurboQuantConfig = None  # type: ignore
+    TurboQuantKVCache = None  # type: ignore
+
+_turboquant_config: Optional["TurboQuantConfig"] = None
+
+
+def get_turboquant_config() -> Optional["TurboQuantConfig"]:
+    """Get or create TurboQuant config from environment."""
+    global _turboquant_config
+    if _turboquant_config is not None:
+        return _turboquant_config
+    if not TURBOQUANT_AVAILABLE:
+        return None
+    _turboquant_config = TurboQuantConfig.from_env()
+    return _turboquant_config
+
 
 def _hermes_home() -> Path:
     return Path(os.getenv("HERMES_HOME", Path.home() / ".hermes"))
@@ -531,13 +553,41 @@ class LocalMLXService:
             raise RuntimeError("mlx_lm is not installed for direct MLX chat.") from exc
 
         sampler = make_sampler(temp=float(temperature or 0.0))
+        gen_max_tokens = max_tokens or int(os.getenv("LOCAL_MLX_MAX_TOKENS", "4096"))
+
+        # Build generation kwargs
+        gen_kwargs: Dict[str, Any] = {
+            "max_tokens": gen_max_tokens,
+            "sampler": sampler,
+            "verbose": False,
+        }
+
+        # TurboQuant KV cache compression
+        tq_config = get_turboquant_config()
+        if tq_config and tq_config.enabled and TURBOQUANT_AVAILABLE:
+            try:
+                from mlx_lm.models.llama import KVCache as _StockKVCache
+                # Detect number of layers from model
+                n_layers = 0
+                if hasattr(model, "model") and hasattr(model.model, "layers"):
+                    n_layers = len(model.model.layers)
+                elif hasattr(model, "layers"):
+                    n_layers = len(model.layers)
+                if n_layers > 0:
+                    prompt_cache = [TurboQuantKVCache(config=tq_config) for _ in range(n_layers)]
+                    gen_kwargs["prompt_cache"] = prompt_cache
+                    logger.info(
+                        "TurboQuant KV compression enabled: %d-bit (%d+1) across %d layers",
+                        tq_config.total_bits, tq_config.stage1_bits, n_layers,
+                    )
+            except Exception as exc:
+                logger.warning("TurboQuant cache setup failed, using standard cache: %s", exc)
+
         generated = generate(
             model,
             tokenizer,
             prompt=prompt,
-            max_tokens=max_tokens or int(os.getenv("LOCAL_MLX_MAX_TOKENS", "4096")),
-            sampler=sampler,
-            verbose=False,
+            **gen_kwargs,
         )
         text = generated if isinstance(generated, str) else str(generated)
         visible_text = _strip_think_artifacts(text)

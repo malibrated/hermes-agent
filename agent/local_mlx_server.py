@@ -9,7 +9,7 @@ import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Dict
 
-from agent.local_mlx import DEFAULT_LOCAL_MLX_PORT, LocalMLXService
+from agent.local_mlx import DEFAULT_LOCAL_MLX_PORT, LocalMLXService, get_turboquant_config, TURBOQUANT_AVAILABLE
 
 logger = logging.getLogger(__name__)
 
@@ -80,7 +80,17 @@ class _Handler(BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:
         if self.path == "/health":
-            self._write_json(200, {"status": "ok"})
+            tq_config = get_turboquant_config()
+            tq_info = {}
+            if TURBOQUANT_AVAILABLE and tq_config:
+                tq_info = {
+                    "turboquant_available": True,
+                    "turboquant_enabled": tq_config.enabled,
+                    "turboquant_bits": f"{tq_config.stage1_bits}+1",
+                }
+            else:
+                tq_info = {"turboquant_available": TURBOQUANT_AVAILABLE}
+            self._write_json(200, {"status": "ok", **tq_info})
             return
         self._write_json(404, {"error": f"unknown path: {self.path}"})
 
