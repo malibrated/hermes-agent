@@ -509,28 +509,37 @@ class InferenceEngine:
         # Don't strip think artifacts here — let Hermes handle reasoning content
         visible_text = text
 
-        # Parse tool calls (same logic as LocalMLXService.chat_completion)
+        # Parse tool calls from various local model formats
         from types import SimpleNamespace
+        import re
         tool_calls = None
         content = visible_text
         finish_reason = "stop"
 
         if request.tools:
-            parsed = _extract_json_object(text)
-            if parsed and isinstance(parsed.get("tool_calls"), list):
+            # 1. Gemma 4 native format: <|tool_call>call:func_name{json}<tool_call|>
+            gemma_calls = re.findall(
+                r'<\|tool_call>call:(\w+)\{(.*?)\}<tool_call\|>',
+                text, re.DOTALL
+            )
+            if gemma_calls:
                 tool_calls = []
-                for call in parsed["tool_calls"]:
-                    if not isinstance(call, dict) or not call.get("name"):
-                        continue
-                    args = call.get("arguments", {})
-                    if not isinstance(args, dict):
+                for name, args_str in gemma_calls:
+                    try:
+                        args = json.loads("{" + args_str + "}") if not args_str.startswith("{") else json.loads(args_str)
+                    except (json.JSONDecodeError, Exception):
+                        # Try treating as key:value pairs
                         args = {}
+                        for pair in args_str.split(","):
+                            if ":" in pair:
+                                k, v = pair.split(":", 1)
+                                args[k.strip().strip("'")] = v.strip().strip("'")
                     tool_calls.append(
                         SimpleNamespace(
                             id=f"mlx_call_{uuid.uuid4().hex[:10]}",
                             type="function",
                             function=SimpleNamespace(
-                                name=str(call["name"]),
+                                name=str(name),
                                 arguments=json.dumps(args, ensure_ascii=False),
                             ),
                         )
@@ -538,11 +547,40 @@ class InferenceEngine:
                 if tool_calls:
                     content = None
                     finish_reason = "tool_calls"
+
+            # 2. JSON format: {"tool_calls": [{"name": ..., "arguments": ...}]}
+            if not tool_calls:
+                parsed = _extract_json_object(text)
+                if parsed and isinstance(parsed.get("tool_calls"), list):
+                    tool_calls = []
+                    for call in parsed["tool_calls"]:
+                        if not isinstance(call, dict) or not call.get("name"):
+                            continue
+                        args = call.get("arguments", {})
+                        if not isinstance(args, dict):
+                            args = {}
+                        tool_calls.append(
+                            SimpleNamespace(
+                                id=f"mlx_call_{uuid.uuid4().hex[:10]}",
+                                type="function",
+                                function=SimpleNamespace(
+                                    name=str(call["name"]),
+                                    arguments=json.dumps(args, ensure_ascii=False),
+                                ),
+                            )
+                        )
+                    if tool_calls:
+                        content = None
+                        finish_reason = "tool_calls"
+
+            # 3. XML format: <tool_call>...</tool_call> or <func_name>...</func_name>
             if not tool_calls:
                 tool_calls = _recover_xml_tool_calls(text, request.tools)
                 if tool_calls:
                     content = None
                     finish_reason = "tool_calls"
+
+            # 4. Terminal code blocks
             if not tool_calls:
                 tool_calls = _recover_terminal_tool_calls(text, request.tools)
                 if tool_calls:
