@@ -458,11 +458,19 @@ class InferenceEngine:
             if tq_config:
                 gen_kwargs["kv_bits"] = tq_config["bits"]
 
+            logger.info(
+                "vlm_generate: model=%s max_tokens=%s prompt_len=%d",
+                model_name, gen_kwargs.get("max_tokens"), len(prompt_text),
+            )
             result = vlm_generate(
                 model, tokenizer_or_processor,
                 prompt=prompt_text, **gen_kwargs,
             )
             text = result.text if hasattr(result, "text") else str(result)
+            logger.info(
+                "vlm_generate result: %d chars, starts_with=%r",
+                len(text), text[:100] if text else "",
+            )
         else:
             from mlx_lm import generate as lm_generate
             from mlx_lm.sample_utils import make_sampler
@@ -498,7 +506,8 @@ class InferenceEngine:
             )
             text = generated if isinstance(generated, str) else str(generated)
 
-        visible_text = _strip_think_artifacts(text)
+        # Don't strip think artifacts here — let Hermes handle reasoning content
+        visible_text = text
 
         # Parse tool calls (same logic as LocalMLXService.chat_completion)
         from types import SimpleNamespace
