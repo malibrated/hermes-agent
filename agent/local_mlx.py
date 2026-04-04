@@ -43,27 +43,33 @@ DEFAULT_LOCAL_MLX_EMBED_MODEL = os.getenv(
 DEFAULT_LOCAL_MLX_PORT = int(os.getenv("LOCAL_MLX_PORT", "53147"))
 DEFAULT_LOCAL_MLX_BASE_URL = f"http://127.0.0.1:{DEFAULT_LOCAL_MLX_PORT}"
 
-# TurboQuant KV cache compression
+# TurboQuant KV cache compression (via mlx-vlm)
 try:
-    from agent.kv_compression import TurboQuantConfig, TurboQuantKVCache
+    from mlx_vlm.turboquant import TurboQuantKVCache
     TURBOQUANT_AVAILABLE = True
 except ImportError:
     TURBOQUANT_AVAILABLE = False
-    TurboQuantConfig = None  # type: ignore
     TurboQuantKVCache = None  # type: ignore
 
-_turboquant_config: Optional["TurboQuantConfig"] = None
+# Config via env vars:
+#   TURBOQUANT_ENABLED=1    — enable TurboQuant KV compression
+#   TURBOQUANT_BITS=4       — bits per coordinate (supports fractional, e.g. 3.5)
+#   TURBOQUANT_SEED=0       — seed for rotation/projection matrices
+_turboquant_enabled: Optional[bool] = None
+_turboquant_bits: float = 4.0
+_turboquant_seed: int = 0
 
 
-def get_turboquant_config() -> Optional["TurboQuantConfig"]:
-    """Get or create TurboQuant config from environment."""
-    global _turboquant_config
-    if _turboquant_config is not None:
-        return _turboquant_config
-    if not TURBOQUANT_AVAILABLE:
+def get_turboquant_config() -> Optional[Dict[str, Any]]:
+    """Get TurboQuant config from environment."""
+    global _turboquant_enabled, _turboquant_bits, _turboquant_seed
+    if _turboquant_enabled is None:
+        _turboquant_enabled = os.getenv("TURBOQUANT_ENABLED", "").strip().lower() in {"1", "true", "yes"}
+        _turboquant_bits = float(os.getenv("TURBOQUANT_BITS", "4"))
+        _turboquant_seed = int(os.getenv("TURBOQUANT_SEED", "0"))
+    if not _turboquant_enabled or not TURBOQUANT_AVAILABLE:
         return None
-    _turboquant_config = TurboQuantConfig.from_env()
-    return _turboquant_config
+    return {"enabled": True, "bits": _turboquant_bits, "seed": _turboquant_seed}
 
 
 def _hermes_home() -> Path:
@@ -491,19 +497,28 @@ class LocalMLXService:
             cached = self._chat_models.get(model_name)
             if cached is not None:
                 return cached
-            try:
-                from mlx_lm import load
-            except Exception as exc:
-                raise RuntimeError("mlx_lm is not installed for direct MLX chat.") from exc
             with warnings.catch_warnings():
                 warnings.filterwarnings(
                     "ignore",
                     message=r"The tokenizer you are loading from '.*' with an incorrect regex pattern:.*",
                 )
-                model, tokenizer = load(model_name)
-            cached = (model, tokenizer)
+                # Try mlx_vlm first (supports both multimodal and text-only), fall back to mlx_lm
+                try:
+                    from mlx_vlm import load as mlx_vlm_load
+                    model, processor = mlx_vlm_load(model_name)
+                    cached = (model, processor, "mlx_vlm")
+                except (ValueError, ImportError, Exception) as exc:
+                    logger.info("mlx_vlm cannot load %s (%s), trying mlx_lm...", model_name, exc)
+                    try:
+                        from mlx_lm import load as mlx_lm_load
+                        model, tokenizer = mlx_lm_load(model_name)
+                        cached = (model, tokenizer, "mlx_lm")
+                    except Exception as lm_exc:
+                        raise RuntimeError(
+                            f"Neither mlx_vlm nor mlx_lm can load {model_name}"
+                        ) from lm_exc
             self._chat_models[model_name] = cached
-            logger.info("Loaded local MLX chat model: %s", model_name)
+            logger.info("Loaded local MLX chat model: %s (via %s)", model_name, cached[2])
             return cached
 
     def _load_embedder(self, model_name: str):
@@ -530,13 +545,102 @@ class LocalMLXService:
         max_tokens: Optional[int] = None,
     ) -> Any:
         model_name = model_name or DEFAULT_LOCAL_MLX_MODEL
-        model, tokenizer = self._load_chat(model_name)
+        loaded = self._load_chat(model_name)
+        model, tokenizer_or_processor, backend = loaded
         normalized = _normalize_messages(messages)
         if tools:
             instruction = _tool_instruction(tools)
             if instruction:
                 normalized = [{"role": "system", "content": instruction}] + normalized
 
+        gen_max_tokens = max_tokens or int(os.getenv("LOCAL_MLX_MAX_TOKENS", "4096"))
+
+        # --- mlx_vlm backend (multimodal models like Gemma 4) ---
+        if backend == "mlx_vlm":
+            processor = tokenizer_or_processor
+            try:
+                prompt = processor.apply_chat_template(
+                    normalized,
+                    tokenize=False,
+                    add_generation_prompt=True,
+                )
+            except Exception:
+                prompt = "\n\n".join(
+                    f"{m['role'].upper()}: {m['content']}" for m in normalized
+                ) + "\n\nASSISTANT:"
+
+            from mlx_vlm import generate as vlm_generate
+
+            gen_kwargs: Dict[str, Any] = {
+                "max_tokens": gen_max_tokens,
+                "temperature": float(temperature or 0.0),
+                "verbose": False,
+            }
+
+            # TurboQuant for mlx_vlm
+            tq_config = get_turboquant_config()
+            if tq_config and TURBOQUANT_AVAILABLE:
+                gen_kwargs["kv_bits"] = tq_config["bits"]
+                logger.info(
+                    "TurboQuant KV compression enabled: %g-bit (mlx-vlm native)",
+                    tq_config["bits"],
+                )
+
+            result = vlm_generate(
+                model,
+                processor,
+                prompt=prompt,
+                **gen_kwargs,
+            )
+            # mlx_vlm.generate returns a GenerationResult with .text
+            text = result.text if hasattr(result, "text") else str(result)
+            visible_text = _strip_think_artifacts(text)
+
+            # Parse tool calls
+            tool_calls = None
+            content = visible_text
+            finish_reason = "stop"
+            if tools:
+                parsed = _extract_json_object(text)
+                if parsed and isinstance(parsed.get("tool_calls"), list):
+                    tool_calls = []
+                    for call in parsed["tool_calls"]:
+                        if not isinstance(call, dict) or not call.get("name"):
+                            continue
+                        args = call.get("arguments", {})
+                        if not isinstance(args, dict):
+                            args = {}
+                        tool_calls.append(
+                            SimpleNamespace(
+                                id=f"mlx_call_{uuid.uuid4().hex[:10]}",
+                                type="function",
+                                function=SimpleNamespace(
+                                    name=str(call["name"]),
+                                    arguments=json.dumps(args, ensure_ascii=False),
+                                ),
+                            )
+                        )
+                    if tool_calls:
+                        content = None
+                        finish_reason = "tool_calls"
+                if not tool_calls:
+                    tool_calls = _recover_xml_tool_calls(text, tools)
+                    if tool_calls:
+                        content = None
+                        finish_reason = "tool_calls"
+                if not tool_calls:
+                    tool_calls = _recover_terminal_tool_calls(text, tools)
+                    if tool_calls:
+                        content = None
+                        finish_reason = "tool_calls"
+
+            message = SimpleNamespace(role="assistant", content=content, tool_calls=tool_calls)
+            choice = SimpleNamespace(index=0, message=message, finish_reason=finish_reason)
+            usage = SimpleNamespace(prompt_tokens=0, completion_tokens=0, total_tokens=0)
+            return SimpleNamespace(choices=[choice], model=model_name, usage=usage)
+
+        # --- mlx_lm backend (text-only models) ---
+        tokenizer = tokenizer_or_processor
         try:
             prompt = tokenizer.apply_chat_template(
                 normalized,
@@ -553,32 +657,31 @@ class LocalMLXService:
             raise RuntimeError("mlx_lm is not installed for direct MLX chat.") from exc
 
         sampler = make_sampler(temp=float(temperature or 0.0))
-        gen_max_tokens = max_tokens or int(os.getenv("LOCAL_MLX_MAX_TOKENS", "4096"))
 
-        # Build generation kwargs
         gen_kwargs: Dict[str, Any] = {
             "max_tokens": gen_max_tokens,
             "sampler": sampler,
             "verbose": False,
         }
 
-        # TurboQuant KV cache compression
+        # TurboQuant KV cache compression for mlx_lm path
         tq_config = get_turboquant_config()
-        if tq_config and tq_config.enabled and TURBOQUANT_AVAILABLE:
+        if tq_config and TURBOQUANT_AVAILABLE:
             try:
-                from mlx_lm.models.llama import KVCache as _StockKVCache
-                # Detect number of layers from model
                 n_layers = 0
                 if hasattr(model, "model") and hasattr(model.model, "layers"):
                     n_layers = len(model.model.layers)
                 elif hasattr(model, "layers"):
                     n_layers = len(model.layers)
                 if n_layers > 0:
-                    prompt_cache = [TurboQuantKVCache(config=tq_config) for _ in range(n_layers)]
+                    prompt_cache = [
+                        TurboQuantKVCache(bits=tq_config["bits"], seed=tq_config["seed"])
+                        for _ in range(n_layers)
+                    ]
                     gen_kwargs["prompt_cache"] = prompt_cache
                     logger.info(
-                        "TurboQuant KV compression enabled: %d-bit (%d+1) across %d layers",
-                        tq_config.total_bits, tq_config.stage1_bits, n_layers,
+                        "TurboQuant KV compression enabled: %g-bit across %d layers (mlx-lm)",
+                        tq_config["bits"], n_layers,
                     )
             except Exception as exc:
                 logger.warning("TurboQuant cache setup failed, using standard cache: %s", exc)
