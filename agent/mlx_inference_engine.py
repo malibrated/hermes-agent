@@ -441,7 +441,7 @@ class InferenceEngine:
             ) + "\n\nASSISTANT:"
 
         max_tokens = request.max_tokens or int(
-            os.getenv("LOCAL_MLX_MAX_TOKENS", "4096")
+            os.getenv("LOCAL_MLX_MAX_TOKENS", "131072")
         )
 
         # Generate using the appropriate backend

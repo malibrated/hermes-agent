@@ -553,7 +553,7 @@ class LocalMLXService:
             if instruction:
                 normalized = [{"role": "system", "content": instruction}] + normalized
 
-        gen_max_tokens = max_tokens or int(os.getenv("LOCAL_MLX_MAX_TOKENS", "4096"))
+        gen_max_tokens = max_tokens or int(os.getenv("LOCAL_MLX_MAX_TOKENS", "131072"))
 
         # --- mlx_vlm backend (multimodal models like Gemma 4) ---
         if backend == "mlx_vlm":
