@@ -2585,6 +2585,8 @@ class AIAgent:
             return tc.get("id", "") or ""
         return getattr(tc, "id", "") or ""
 
+    _VALID_API_ROLES = frozenset({"system", "user", "assistant", "tool", "function", "developer"})
+
     @staticmethod
     def _sanitize_api_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """Fix orphaned tool_call / tool_result pairs before every LLM call.
@@ -2593,6 +2595,19 @@ class AIAgent:
         is present — so orphans from session loading or manual message
         manipulation are always caught.
         """
+        # --- Role allowlist: drop messages with roles the API won't accept ---
+        filtered = []
+        for msg in messages:
+            role = msg.get("role")
+            if role not in AIAgent._VALID_API_ROLES:
+                logger.debug(
+                    "Pre-call sanitizer: dropping message with invalid role %r",
+                    role,
+                )
+                continue
+            filtered.append(msg)
+        messages = filtered
+
         surviving_call_ids: set = set()
         for msg in messages:
             if msg.get("role") == "assistant":
@@ -4473,6 +4488,29 @@ class AIAgent:
                     pass
                 raise InterruptedError("Agent interrupted during streaming API call")
         if result["error"] is not None:
+            if deltas_were_sent["yes"]:
+                # Streaming failed AFTER some tokens were already delivered to
+                # the platform.  Re-raising would let the outer retry loop make
+                # a new API call, creating a duplicate message.  Return a
+                # partial "stop" response instead so the outer loop treats this
+                # turn as complete (no retry, no fallback).
+                logger.warning(
+                    "Partial stream delivered before error; returning stub "
+                    "response to prevent duplicate messages: %s",
+                    result["error"],
+                )
+                _stub_msg = SimpleNamespace(
+                    role="assistant", content=None, tool_calls=None,
+                    reasoning_content=None,
+                )
+                return SimpleNamespace(
+                    id="partial-stream-stub",
+                    model=getattr(self, "model", "unknown"),
+                    choices=[SimpleNamespace(
+                        index=0, message=_stub_msg, finish_reason="stop",
+                    )],
+                    usage=None,
+                )
             raise result["error"]
         return result["response"]
 
@@ -6009,6 +6047,30 @@ class AIAgent:
                         spinner.stop(cute_msg)
                     elif self.quiet_mode:
                         self._vprint(f"  {cute_msg}")
+            elif self._memory_manager and self._memory_manager.has_tool(function_name):
+                # Memory provider tools (hindsight_retain, honcho_search, etc.)
+                # These are not in the tool registry — route through MemoryManager.
+                spinner = None
+                if self.quiet_mode and not self.tool_progress_callback:
+                    face = random.choice(KawaiiSpinner.KAWAII_WAITING)
+                    emoji = _get_tool_emoji(function_name)
+                    preview = _build_tool_preview(function_name, function_args) or function_name
+                    spinner = KawaiiSpinner(f"{face} {emoji} {preview}", spinner_type='dots', print_fn=self._print_fn)
+                    spinner.start()
+                _mem_result = None
+                try:
+                    function_result = self._memory_manager.handle_tool_call(function_name, function_args)
+                    _mem_result = function_result
+                except Exception as tool_error:
+                    function_result = json.dumps({"error": f"Memory tool '{function_name}' failed: {tool_error}"})
+                    logger.error("memory_manager.handle_tool_call raised for %s: %s", function_name, tool_error, exc_info=True)
+                finally:
+                    tool_duration = time.time() - tool_start_time
+                    cute_msg = _get_cute_tool_message_impl(function_name, function_args, tool_duration, result=_mem_result)
+                    if spinner:
+                        spinner.stop(cute_msg)
+                    elif self.quiet_mode:
+                        self._vprint(f"  {cute_msg}")
             elif self.quiet_mode:
                 spinner = None
                 if not self.tool_progress_callback:
@@ -6627,10 +6689,12 @@ class AIAgent:
         # External memory provider: prefetch once before the tool loop.
         # Reuse the cached result on every iteration to avoid re-calling
         # prefetch_all() on each tool call (10 tool calls = 10x latency + cost).
+        # Use original_user_message (clean input) — user_message may contain
+        # injected skill content that bloats / breaks provider queries.
         _ext_prefetch_cache = ""
         if self._memory_manager:
             try:
-                _query = user_message if isinstance(user_message, str) else ""
+                _query = original_user_message if isinstance(original_user_message, str) else ""
                 _ext_prefetch_cache = self._memory_manager.prefetch_all(_query) or ""
             except Exception:
                 pass
@@ -6656,10 +6720,21 @@ class AIAgent:
             if self.step_callback is not None:
                 try:
                     prev_tools = []
-                    for _m in reversed(messages):
+                    for _idx, _m in enumerate(reversed(messages)):
                         if _m.get("role") == "assistant" and _m.get("tool_calls"):
+                            _fwd_start = len(messages) - _idx
+                            _results_by_id = {}
+                            for _tm in messages[_fwd_start:]:
+                                if _tm.get("role") != "tool":
+                                    break
+                                _tcid = _tm.get("tool_call_id")
+                                if _tcid:
+                                    _results_by_id[_tcid] = _tm.get("content", "")
                             prev_tools = [
-                                tc["function"]["name"]
+                                {
+                                    "name": tc["function"]["name"],
+                                    "result": _results_by_id.get(tc.get("id")),
+                                }
                                 for tc in _m["tool_calls"]
                                 if isinstance(tc, dict)
                             ]
@@ -7369,6 +7444,61 @@ class AIAgent:
                     # compress history and retry, not abort immediately.
                     status_code = getattr(api_error, "status_code", None)
 
+                    # ── Anthropic Sonnet long-context tier gate ───────────
+                    # Anthropic returns HTTP 429 "Extra usage is required for
+                    # long context requests" when a Claude Max (or similar)
+                    # subscription doesn't include the 1M-context tier.  This
+                    # is NOT a transient rate limit — retrying or switching
+                    # credentials won't help.  Reduce context to 200k (the
+                    # standard tier) and compress.
+                    # Only applies to Sonnet — Opus 1M is general access.
+                    _is_long_context_tier_error = (
+                        status_code == 429
+                        and "extra usage" in error_msg
+                        and "long context" in error_msg
+                        and "sonnet" in self.model.lower()
+                    )
+                    if _is_long_context_tier_error:
+                        _reduced_ctx = 200000
+                        compressor = self.context_compressor
+                        old_ctx = compressor.context_length
+                        if old_ctx > _reduced_ctx:
+                            compressor.context_length = _reduced_ctx
+                            compressor.threshold_tokens = int(
+                                _reduced_ctx * compressor.threshold_percent
+                            )
+                            compressor._context_probed = True
+                            # Don't persist — this is a subscription-tier
+                            # limitation, not a model capability.  If the user
+                            # later enables extra usage the 1M limit should
+                            # come back automatically.
+                            compressor._context_probe_persistable = False
+                            self._vprint(
+                                f"{self.log_prefix}⚠️  Anthropic long-context tier "
+                                f"requires extra usage — reducing context: "
+                                f"{old_ctx:,} → {_reduced_ctx:,} tokens",
+                                force=True,
+                            )
+
+                        compression_attempts += 1
+                        if compression_attempts <= max_compression_attempts:
+                            original_len = len(messages)
+                            messages, active_system_prompt = self._compress_context(
+                                messages, system_message,
+                                approx_tokens=approx_tokens,
+                                task_id=effective_task_id,
+                            )
+                            if len(messages) < original_len or old_ctx > _reduced_ctx:
+                                self._emit_status(
+                                    f"🗜️ Context reduced to {_reduced_ctx:,} tokens "
+                                    f"(was {old_ctx:,}), retrying..."
+                                )
+                                time.sleep(2)
+                                restart_with_compressed_messages = True
+                                break
+                        # Fall through to normal error handling if compression
+                        # is exhausted or didn't help.
+
                     # Eager fallback for rate-limit errors (429 or quota exhaustion).
                     # When a fallback model is configured, switch immediately instead
                     # of burning through retries with exponential backoff -- the
@@ -7474,7 +7604,33 @@ class AIAgent:
                                 f"treating as probable context overflow.",
                                 force=True,
                             )
-                    
+
+                    # Server disconnects on large sessions are often caused by
+                    # the request exceeding the provider's context/payload limit
+                    # without a proper HTTP error response.  Treat these as
+                    # context-length errors to trigger compression rather than
+                    # burning through retries that will all fail the same way.
+                    # This breaks the death spiral: disconnect → no token data
+                    # → no compression → bigger session → more disconnects.
+                    # (#2153)
+                    if not is_context_length_error and not status_code:
+                        _is_server_disconnect = (
+                            'server disconnected' in error_msg
+                            or 'peer closed connection' in error_msg
+                            or error_type in ('ReadError', 'RemoteProtocolError', 'ServerDisconnectedError')
+                        )
+                        if _is_server_disconnect:
+                            ctx_len = getattr(getattr(self, 'context_compressor', None), 'context_length', 200000)
+                            _is_large = approx_tokens > ctx_len * 0.6 or len(api_messages) > 200
+                            if _is_large:
+                                is_context_length_error = True
+                                self._vprint(
+                                    f"{self.log_prefix}⚠️  Server disconnected with large session "
+                                    f"(~{approx_tokens:,} tokens, {len(api_messages)} msgs) — "
+                                    f"treating as context-length error, attempting compression.",
+                                    force=True,
+                                )
+
                     if is_context_length_error:
                         compressor = self.context_compressor
                         old_ctx = compressor.context_length
@@ -8109,11 +8265,20 @@ class AIAgent:
                     # threshold (default 50%) leaves ample headroom; if tool
                     # results push past it, the next API call will report the
                     # real total and trigger compression then.
+                    #
+                    # If last_prompt_tokens is 0 (stale after API disconnect
+                    # or provider returned no usage data), fall back to rough
+                    # estimate to avoid missing compression.  Without this,
+                    # a session can grow unbounded after disconnects because
+                    # should_compress(0) never fires.  (#2153)
                     _compressor = self.context_compressor
-                    _real_tokens = (
-                        _compressor.last_prompt_tokens
-                        + _compressor.last_completion_tokens
-                    )
+                    if _compressor.last_prompt_tokens > 0:
+                        _real_tokens = (
+                            _compressor.last_prompt_tokens
+                            + _compressor.last_completion_tokens
+                        )
+                    else:
+                        _real_tokens = estimate_messages_tokens_rough(messages)
 
                     # ── Context pressure warnings (user-facing only) ──────────
                     # Notify the user (NOT the LLM) as context approaches the
@@ -8503,11 +8668,13 @@ class AIAgent:
             _should_review_skills = True
             self._iters_since_skill = 0
 
-        # External memory provider: sync the completed turn + queue next prefetch
-        if self._memory_manager and final_response and user_message:
+        # External memory provider: sync the completed turn + queue next prefetch.
+        # Use original_user_message (clean input) — user_message may contain
+        # injected skill content that bloats / breaks provider queries.
+        if self._memory_manager and final_response and original_user_message:
             try:
-                self._memory_manager.sync_all(user_message, final_response)
-                self._memory_manager.queue_prefetch_all(user_message)
+                self._memory_manager.sync_all(original_user_message, final_response)
+                self._memory_manager.queue_prefetch_all(original_user_message)
             except Exception:
                 pass
 
