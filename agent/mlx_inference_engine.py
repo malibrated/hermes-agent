@@ -399,8 +399,9 @@ class InferenceEngine:
             "mlx-community/Qwen3.5-27B-Claude-4.6-Opus-Distilled-MLX-4bit",
         )
 
-        # Load model
-        model, tokenizer = self._service._load_chat(model_name)
+        # Load model (returns 3-tuple: model, tokenizer_or_processor, backend)
+        loaded = self._service._load_chat(model_name)
+        model, tokenizer_or_processor, backend = loaded
 
         # Split messages into system prefix and conversation
         system_msgs, conversation_msgs = _split_system_messages(request.messages)
@@ -410,15 +411,12 @@ class InferenceEngine:
         if system_msgs:
             prefix_hash = _hash_messages(system_msgs)
             if not self._prefix_cache.matches(prefix_hash, model_name):
-                self._prefix_cache.build(model, tokenizer, system_msgs, model_name)
+                self._prefix_cache.build(model, tokenizer_or_processor, system_msgs, model_name)
 
         # Get or create session cache
         session = self._get_or_create_session(request.session_id, model_name)
         session.touch()
 
-        # Build the full prompt for generation
-        # (We still use mlx_lm's generate path for correctness — the session
-        # cache is passed as prompt_cache so it reuses existing KV state.)
         from agent.local_mlx import (
             _normalize_messages, _tool_instruction, _strip_think_artifacts,
             _extract_json_object, _recover_xml_tool_calls,
@@ -432,7 +430,7 @@ class InferenceEngine:
                 normalized = [{"role": "system", "content": instruction}] + normalized
 
         try:
-            prompt_text = tokenizer.apply_chat_template(
+            prompt_text = tokenizer_or_processor.apply_chat_template(
                 normalized, tokenize=False, add_generation_prompt=True,
             )
         except Exception:
@@ -440,48 +438,64 @@ class InferenceEngine:
                 f"{m['role'].upper()}: {m['content']}" for m in normalized
             ) + "\n\nASSISTANT:"
 
-        try:
-            from mlx_lm import generate
-            from mlx_lm.sample_utils import make_sampler
-        except Exception as exc:
-            raise RuntimeError("mlx_lm is not installed") from exc
-
-        sampler = make_sampler(temp=float(request.temperature or 0.0))
         max_tokens = request.max_tokens or int(
             os.getenv("LOCAL_MLX_MAX_TOKENS", "4096")
         )
 
-        gen_kwargs: Dict[str, Any] = {
-            "max_tokens": max_tokens,
-            "sampler": sampler,
-            "verbose": False,
-        }
+        # Generate using the appropriate backend
+        if backend == "mlx_vlm":
+            from mlx_vlm import generate as vlm_generate
+            from agent.local_mlx import get_turboquant_config
 
-        # Use session's prompt cache if available
-        if session.prompt_cache is not None:
-            gen_kwargs["prompt_cache"] = session.prompt_cache
-            cache_hit = True
-        elif self._prefix_cache.is_valid:
-            # Fork from shared prefix for this session
-            try:
-                session.prompt_cache = self._prefix_cache.fork(
-                    use_turboquant=self._use_turboquant,
-                    tq_bits=self._tq_config.get("bits", 4.0) if self._tq_config else 4.0,
-                    tq_seed=self._tq_config.get("seed", 0) if self._tq_config else 0,
-                )
-                session.prefix_token_count = self._prefix_cache.token_count
-                session.prefix_hash = self._prefix_cache.prompt_hash
+            gen_kwargs: Dict[str, Any] = {
+                "max_tokens": max_tokens,
+                "temperature": float(request.temperature or 0.0),
+                "verbose": False,
+            }
+            tq_config = get_turboquant_config()
+            if tq_config:
+                gen_kwargs["kv_bits"] = tq_config["bits"]
+
+            result = vlm_generate(
+                model, tokenizer_or_processor,
+                prompt=prompt_text, **gen_kwargs,
+            )
+            text = result.text if hasattr(result, "text") else str(result)
+        else:
+            from mlx_lm import generate as lm_generate
+            from mlx_lm.sample_utils import make_sampler
+
+            sampler = make_sampler(temp=float(request.temperature or 0.0))
+            gen_kwargs: Dict[str, Any] = {
+                "max_tokens": max_tokens,
+                "sampler": sampler,
+                "verbose": False,
+            }
+
+            # Session cache (only for mlx_lm path — mlx_vlm manages its own)
+            if session.prompt_cache is not None:
                 gen_kwargs["prompt_cache"] = session.prompt_cache
                 cache_hit = True
-                logger.debug(
-                    "Session %s forked from shared prefix (%d tokens)",
-                    request.session_id, self._prefix_cache.token_count,
-                )
-            except Exception as exc:
-                logger.warning("Failed to fork prefix cache: %s", exc)
+            elif self._prefix_cache.is_valid:
+                try:
+                    session.prompt_cache = self._prefix_cache.fork(
+                        use_turboquant=self._use_turboquant,
+                        tq_bits=self._tq_config.get("bits", 4.0) if self._tq_config else 4.0,
+                        tq_seed=self._tq_config.get("seed", 0) if self._tq_config else 0,
+                    )
+                    session.prefix_token_count = self._prefix_cache.token_count
+                    session.prefix_hash = self._prefix_cache.prompt_hash
+                    gen_kwargs["prompt_cache"] = session.prompt_cache
+                    cache_hit = True
+                except Exception as exc:
+                    logger.warning("Failed to fork prefix cache: %s", exc)
 
-        generated = generate(model, tokenizer, prompt=prompt_text, **gen_kwargs)
-        text = generated if isinstance(generated, str) else str(generated)
+            generated = lm_generate(
+                model, tokenizer_or_processor,
+                prompt=prompt_text, **gen_kwargs,
+            )
+            text = generated if isinstance(generated, str) else str(generated)
+
         visible_text = _strip_think_artifacts(text)
 
         # Parse tool calls (same logic as LocalMLXService.chat_completion)
