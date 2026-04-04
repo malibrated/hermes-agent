@@ -179,7 +179,9 @@ class SharedPrefixCache:
                     for m in system_messages
                 )
 
-            tokens = tokenizer.encode(text)
+            # Extract the actual tokenizer from processor objects (e.g. Gemma4Processor)
+            _tok = tokenizer.tokenizer if hasattr(tokenizer, "tokenizer") else tokenizer
+            tokens = _tok.encode(text)
             if not tokens:
                 self._frozen_state = None
                 return
