@@ -106,6 +106,110 @@ class _Handler(BaseHTTPRequestHandler):
         raw = self.rfile.read(length) if length > 0 else b"{}"
         return json.loads(raw.decode("utf-8") or "{}")
 
+    def _write_stream_response(self, response_dict: Dict[str, Any]) -> None:
+        """Send a completed response as SSE chunks in OpenAI streaming format.
+
+        Even though we generate the full response at once (not token-by-token),
+        Hermes expects stream=True and parses SSE events. We emit:
+        1. A single chunk with the full content as a delta
+        2. A final chunk with finish_reason
+        3. [DONE] sentinel
+        """
+        import time
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Connection", "keep-alive")
+        self.end_headers()
+
+        resp_id = response_dict.get("id", f"chatcmpl-local-{int(time.time())}")
+        model = response_dict.get("model", "")
+        created = response_dict.get("created", int(time.time()))
+
+        choices = response_dict.get("choices", [])
+        if not choices:
+            self.wfile.write(b"data: [DONE]\n\n")
+            self.wfile.flush()
+            return
+
+        choice = choices[0]
+        message = choice.get("message", {})
+        content = message.get("content") or ""
+        tool_calls = message.get("tool_calls")
+        finish_reason = choice.get("finish_reason", "stop")
+
+        # Chunk 1: role
+        chunk_role = {
+            "id": resp_id,
+            "object": "chat.completion.chunk",
+            "created": created,
+            "model": model,
+            "choices": [{
+                "index": 0,
+                "delta": {"role": "assistant", "content": ""},
+                "finish_reason": None,
+            }],
+        }
+        self.wfile.write(f"data: {json.dumps(chunk_role)}\n\n".encode())
+
+        # Chunk 2: content (full response as one delta)
+        if content:
+            chunk_content = {
+                "id": resp_id,
+                "object": "chat.completion.chunk",
+                "created": created,
+                "model": model,
+                "choices": [{
+                    "index": 0,
+                    "delta": {"content": content},
+                    "finish_reason": None,
+                }],
+            }
+            self.wfile.write(f"data: {json.dumps(chunk_content)}\n\n".encode())
+
+        # Chunk 2b: tool calls if present
+        if tool_calls:
+            for i, tc in enumerate(tool_calls):
+                chunk_tc = {
+                    "id": resp_id,
+                    "object": "chat.completion.chunk",
+                    "created": created,
+                    "model": model,
+                    "choices": [{
+                        "index": 0,
+                        "delta": {
+                            "tool_calls": [{
+                                "index": i,
+                                "id": tc.get("id", f"call_{i}"),
+                                "type": "function",
+                                "function": tc.get("function", {}),
+                            }],
+                        },
+                        "finish_reason": None,
+                    }],
+                }
+                self.wfile.write(f"data: {json.dumps(chunk_tc)}\n\n".encode())
+
+        # Chunk 3: finish reason + usage
+        usage = response_dict.get("usage", {})
+        chunk_finish = {
+            "id": resp_id,
+            "object": "chat.completion.chunk",
+            "created": created,
+            "model": model,
+            "choices": [{
+                "index": 0,
+                "delta": {},
+                "finish_reason": finish_reason,
+            }],
+            "usage": usage,
+        }
+        self.wfile.write(f"data: {json.dumps(chunk_finish)}\n\n".encode())
+
+        # Done sentinel
+        self.wfile.write(b"data: [DONE]\n\n")
+        self.wfile.flush()
+
     # ------------------------------------------------------------------
     # GET endpoints
     # ------------------------------------------------------------------
@@ -192,6 +296,13 @@ class _Handler(BaseHTTPRequestHandler):
 
     def _handle_chat_completion(self, payload: Dict[str, Any]) -> None:
         """Submit a chat completion to the inference engine queue."""
+        logger.info(
+            "Incoming request: model=%s messages=%d tools=%d max_tokens=%s",
+            payload.get("model", "?"),
+            len(payload.get("messages", [])),
+            len(payload.get("tools", []) or []),
+            payload.get("max_tokens") or payload.get("max_completion_tokens") or "default",
+        )
         engine = _get_engine()
 
         # Extract session_id — default to a per-request unique ID if not provided
@@ -248,7 +359,12 @@ class _Handler(BaseHTTPRequestHandler):
             "queue_wait_ms": round(result.queue_wait_ms, 1),
             "inference_ms": round(result.inference_ms, 1),
         }
-        self._write_json(200, response_dict)
+
+        # Streaming: send as SSE chunks in OpenAI streaming format
+        if payload.get("stream"):
+            self._write_stream_response(response_dict)
+        else:
+            self._write_json(200, response_dict)
 
     def _handle_embed(self, payload: Dict[str, Any]) -> None:
         """Embedding requests bypass the queue — they're lightweight."""
