@@ -508,14 +508,35 @@ class InferenceEngine:
                 except Exception as exc:
                     logger.warning("Failed to fork prefix cache: %s", exc)
 
+            logger.info(
+                "lm_generate: model=%s max_tokens=%s prompt_len=%d",
+                model_name, gen_kwargs.get("max_tokens"), len(prompt_text),
+            )
             generated = lm_generate(
                 model, tokenizer_or_processor,
                 prompt=prompt_text, **gen_kwargs,
             )
             text = generated if isinstance(generated, str) else str(generated)
+            logger.info(
+                "lm_generate result: %d chars, starts_with=%r",
+                len(text), text[:200] if text else "",
+            )
 
-        # Don't strip think artifacts here — let Hermes handle reasoning content
-        visible_text = text
+        # Strip thinking blocks and special tokens from local model output.
+        # Carnice/Qwen outputs: "thinking...\n</think>\nactual response<|im_end|>"
+        # Standard models may use: "<think>...</think>actual response"
+        import re
+        visible_text = text or ""
+        # Handle standard <think>...</think> blocks
+        visible_text = re.sub(r'<think>.*?</think>\s*', '', visible_text, flags=re.DOTALL)
+        # Handle Carnice-style: everything before </think> is thinking
+        if '</think>' in visible_text:
+            visible_text = visible_text.split('</think>', 1)[-1]
+        # Strip orphan think tags and special tokens
+        visible_text = re.sub(r'</?think>\s*', '', visible_text)
+        visible_text = re.sub(r'<\|im_end\|>\s*', '', visible_text)
+        visible_text = re.sub(r'<\|endoftext\|>\s*', '', visible_text)
+        visible_text = visible_text.strip()
 
         # Parse tool calls from various local model formats
         from types import SimpleNamespace
@@ -595,6 +616,12 @@ class InferenceEngine:
                     content = None
                     finish_reason = "tool_calls"
 
+        logger.info(
+            "Response: content=%r tool_calls=%s finish=%s",
+            (content[:200] if content else None),
+            len(tool_calls) if tool_calls else 0,
+            finish_reason,
+        )
         message = SimpleNamespace(role="assistant", content=content, tool_calls=tool_calls)
         choice = SimpleNamespace(index=0, message=message, finish_reason=finish_reason)
         usage = SimpleNamespace(prompt_tokens=0, completion_tokens=0, total_tokens=0)
