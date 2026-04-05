@@ -408,9 +408,10 @@ class InferenceEngine:
         # Split messages into system prefix and conversation
         system_msgs, conversation_msgs = _split_system_messages(request.messages)
 
-        # Ensure shared prefix cache is up to date
+        # Skip prefix cache for models with custom cache requirements (e.g. hybrid SSM)
+        has_custom_cache = hasattr(model, "make_cache")
         cache_hit = False
-        if system_msgs:
+        if system_msgs and not has_custom_cache:
             prefix_hash = _hash_messages(system_msgs)
             if not self._prefix_cache.matches(prefix_hash, model_name):
                 self._prefix_cache.build(model, tokenizer_or_processor, system_msgs, model_name)
@@ -482,8 +483,10 @@ class InferenceEngine:
                 "verbose": False,
             }
 
-            # Session cache (only for mlx_lm path — mlx_vlm manages its own)
-            if session.prompt_cache is not None:
+            # Session cache (only for standard transformer models, not hybrid SSM)
+            if has_custom_cache:
+                pass  # Let mlx_lm manage its own cache for hybrid models
+            elif session.prompt_cache is not None:
                 gen_kwargs["prompt_cache"] = session.prompt_cache
                 cache_hit = True
             elif self._prefix_cache.is_valid:
