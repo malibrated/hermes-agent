@@ -483,9 +483,16 @@ class InferenceEngine:
                 "verbose": False,
             }
 
-            # Session cache (only for standard transformer models, not hybrid SSM)
             if has_custom_cache:
-                pass  # Let mlx_lm manage its own cache for hybrid models
+                # Hybrid models (Qwen 3.5): use mlx_lm's own kv_bits param
+                # which triggers mlx_lm's maybe_quantize_kv_cache per-step.
+                # This correctly skips ArraysCache (SSM) layers.
+                if self._use_turboquant and self._tq_config:
+                    gen_kwargs["kv_bits"] = int(self._tq_config.get("bits", 4))
+                    logger.info(
+                        "TurboQuant via mlx_lm kv_bits=%d for hybrid model",
+                        gen_kwargs["kv_bits"],
+                    )
             elif session.prompt_cache is not None:
                 gen_kwargs["prompt_cache"] = session.prompt_cache
                 cache_hit = True
@@ -680,9 +687,17 @@ def _split_system_messages(
 
 
 def _make_cache_for_model(model: Any) -> List[Any]:
-    """Create appropriate cache list for the model."""
+    """Create appropriate cache list for the model.
+
+    Handles hybrid architectures (e.g. Qwen 3.5 attention+SSM) by checking
+    for make_cache() on the model or its language_model wrapper, which returns
+    the correct mix of KVCache (attention) and ArraysCache (SSM) per layer.
+    """
     if hasattr(model, "make_cache"):
         return model.make_cache()
+    # VLM models wrap a language_model that has make_cache
+    if hasattr(model, "language_model") and hasattr(model.language_model, "make_cache"):
+        return model.language_model.make_cache()
     from mlx_lm.models.llama import KVCache
     num_layers = len(model.layers) if hasattr(model, "layers") else 0
     if hasattr(model, "model") and hasattr(model.model, "layers"):
