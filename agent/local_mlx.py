@@ -548,10 +548,8 @@ class LocalMLXService:
         loaded = self._load_chat(model_name)
         model, tokenizer_or_processor, backend = loaded
         normalized = _normalize_messages(messages)
-        if tools:
-            instruction = _tool_instruction(tools)
-            if instruction:
-                normalized = [{"role": "system", "content": instruction}] + normalized
+        # Don't inject tool instructions — the caller (Hermes) already
+        # describes tools in its system prompt in the model's native format.
 
         gen_max_tokens = max_tokens or int(os.getenv("LOCAL_MLX_MAX_TOKENS", "8192"))
 

@@ -427,10 +427,8 @@ class InferenceEngine:
         )
 
         normalized = _normalize_messages(request.messages)
-        if request.tools:
-            instruction = _tool_instruction(request.tools)
-            if instruction:
-                normalized = [{"role": "system", "content": instruction}] + normalized
+        # Don't inject tool instructions — Hermes already describes tools
+        # in its system prompt in the format the model was trained on.
 
         try:
             prompt_text = tokenizer_or_processor.apply_chat_template(
