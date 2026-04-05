@@ -599,7 +599,7 @@ class LocalMLXService:
             content = visible_text
             finish_reason = "stop"
             if tools:
-                parsed = _extract_json_object(text)
+                parsed = _extract_json_object(visible_text)
                 if parsed and isinstance(parsed.get("tool_calls"), list):
                     tool_calls = []
                     for call in parsed["tool_calls"]:
@@ -622,12 +622,12 @@ class LocalMLXService:
                         content = None
                         finish_reason = "tool_calls"
                 if not tool_calls:
-                    tool_calls = _recover_xml_tool_calls(text, tools)
+                    tool_calls = _recover_xml_tool_calls(visible_text, tools)
                     if tool_calls:
                         content = None
                         finish_reason = "tool_calls"
                 if not tool_calls:
-                    tool_calls = _recover_terminal_tool_calls(text, tools)
+                    tool_calls = _recover_terminal_tool_calls(visible_text, tools)
                     if tool_calls:
                         content = None
                         finish_reason = "tool_calls"
@@ -697,7 +697,7 @@ class LocalMLXService:
         content = visible_text
         finish_reason = "stop"
         if tools:
-            parsed = _extract_json_object(text)
+            parsed = _extract_json_object(visible_text)
             if parsed and isinstance(parsed.get("tool_calls"), list):
                 tool_calls = []
                 for call in parsed["tool_calls"]:
@@ -720,12 +720,12 @@ class LocalMLXService:
                     content = None
                     finish_reason = "tool_calls"
             if not tool_calls:
-                tool_calls = _recover_xml_tool_calls(text, tools)
+                tool_calls = _recover_xml_tool_calls(visible_text, tools)
                 if tool_calls:
                     content = None
                     finish_reason = "tool_calls"
             if not tool_calls:
-                tool_calls = _recover_terminal_tool_calls(text, tools)
+                tool_calls = _recover_terminal_tool_calls(visible_text, tools)
                 if tool_calls:
                     content = None
                     finish_reason = "tool_calls"

@@ -23,6 +23,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import threading
 import time
 import uuid
@@ -31,6 +32,7 @@ from concurrent.futures import Future
 from dataclasses import dataclass, field
 from pathlib import Path
 from queue import Queue, Empty
+from types import SimpleNamespace
 from typing import Any, Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
@@ -49,6 +51,33 @@ except ImportError:
 
 
 # ---------------------------------------------------------------------------
+# Think-block stripping (shared helper)
+# ---------------------------------------------------------------------------
+
+def _strip_thinking_and_special_tokens(text: str) -> str:
+    """Strip thinking blocks and special tokens from local model output.
+
+    Handles:
+      - Standard: <think>...</think>actual response
+      - Carnice/Qwen: thinking...\n</think>\nactual response
+      - Special tokens: <|im_end|>, <|endoftext|>
+    """
+    if not text:
+        return ""
+    result = text
+    # Handle standard <think>...</think> blocks
+    result = re.sub(r'<think>.*?</think>\s*', '', result, flags=re.DOTALL)
+    # Handle Carnice-style: everything before </think> is thinking
+    if '</think>' in result:
+        result = result.split('</think>', 1)[-1]
+    # Strip orphan think tags and special tokens
+    result = re.sub(r'</?think>\s*', '', result)
+    result = re.sub(r'<\|im_end\|>\s*', '', result)
+    result = re.sub(r'<\|endoftext\|>\s*', '', result)
+    return result.strip()
+
+
+# ---------------------------------------------------------------------------
 # Request / Response types
 # ---------------------------------------------------------------------------
 
@@ -62,6 +91,15 @@ class InferenceRequest:
     temperature: float = 0.2
     max_tokens: Optional[int] = None
     request_id: str = field(default_factory=lambda: uuid.uuid4().hex[:12])
+    enqueued_at: float = 0.0  # Set by submit()
+    _cancelled: threading.Event = field(default_factory=threading.Event, repr=False)
+
+    def cancel(self) -> None:
+        self._cancelled.set()
+
+    @property
+    def is_cancelled(self) -> bool:
+        return self._cancelled.is_set()
 
 
 @dataclass
@@ -84,10 +122,10 @@ class SessionCacheEntry:
     """Per-session KV cache state."""
     session_id: str
     prompt_cache: Optional[List[Any]] = None  # List of KVCache per layer
-    # Hash of the messages that were encoded into the cache, so we can detect
-    # whether the client's conversation prefix still matches.
     prefix_hash: str = ""
     prefix_token_count: int = 0
+    model_name: str = ""
+    backend: str = ""
     last_accessed: float = field(default_factory=time.monotonic)
     total_requests: int = 0
 
@@ -114,15 +152,10 @@ class SessionCacheEntry:
 # ---------------------------------------------------------------------------
 
 class SharedPrefixCache:
-    """Frozen KV cache for the system prompt, shared across all sessions.
-
-    The system prompt (tools, identity, guidance) is encoded once into a
-    KV cache.  Per-session caches fork from this frozen snapshot via
-    deep copy of the MLX arrays, skipping re-encoding the prompt.
-    """
+    """Frozen KV cache for the system prompt, shared across all sessions."""
 
     def __init__(self) -> None:
-        self._frozen_state: Optional[List[Tuple[Any, Any]]] = None  # [(keys, values), ...] per layer
+        self._frozen_state: Optional[List[Tuple[Any, Any]]] = None
         self._prompt_hash: str = ""
         self._token_count: int = 0
         self._model_name: str = ""
@@ -158,15 +191,12 @@ class SharedPrefixCache:
         with self._lock:
             prompt_hash = _hash_messages(system_messages)
             if self.matches(prompt_hash, model_name):
-                return  # Already up to date
+                return
 
             logger.info("Building shared prefix cache for model=%s", model_name)
 
-            from mlx_lm.models.cache import make_prompt_cache
-
             prompt_cache = _make_cache_for_model(model)
 
-            # Tokenize just the system messages
             try:
                 text = tokenizer.apply_chat_template(
                     system_messages,
@@ -179,7 +209,6 @@ class SharedPrefixCache:
                     for m in system_messages
                 )
 
-            # Extract the actual tokenizer from processor objects (e.g. Gemma4Processor)
             _tok = tokenizer.tokenizer if hasattr(tokenizer, "tokenizer") else tokenizer
             tokens = _tok.encode(text)
             if not tokens:
@@ -187,18 +216,14 @@ class SharedPrefixCache:
                 return
 
             token_array = mx.array(tokens)
-
-            # Run the model forward to populate the cache
             model(token_array[None], cache=prompt_cache)
             mx.eval(*[c.state for c in prompt_cache if hasattr(c, "state")])
 
-            # Snapshot the state
             self._frozen_state = []
             self._token_count = len(tokens)
             for layer_cache in prompt_cache:
                 if hasattr(layer_cache, "state"):
                     keys, values = layer_cache.state
-                    # Deep copy so the frozen state is immutable
                     self._frozen_state.append((mx.array(keys), mx.array(values)))
                 else:
                     self._frozen_state.append(None)
@@ -211,11 +236,7 @@ class SharedPrefixCache:
             )
 
     def fork(self, use_turboquant: bool = False, tq_bits: float = 4.0, tq_seed: int = 0) -> List[Any]:
-        """Create a new per-session cache forked from the frozen prefix.
-
-        Returns a list of KVCache objects (one per layer) pre-populated
-        with the system prompt's KV state.
-        """
+        """Create a new per-session cache forked from the frozen prefix."""
         if self._frozen_state is None:
             raise RuntimeError("SharedPrefixCache not built yet")
 
@@ -232,7 +253,6 @@ class SharedPrefixCache:
             keys, values = layer_state
 
             if use_turboquant and TURBOQUANT_AVAILABLE:
-                # Create a stock cache with the prefix state, then convert
                 from mlx_lm.models.llama import KVCache
                 stock = KVCache()
                 stock.state = (mx.array(keys), mx.array(values))
@@ -251,10 +271,9 @@ class SharedPrefixCache:
 # Inference engine (singleton)
 # ---------------------------------------------------------------------------
 
-# Defaults
-DEFAULT_MAX_SESSIONS = int(os.getenv("MLX_MAX_SESSIONS", "24"))
-DEFAULT_IDLE_TIMEOUT = float(os.getenv("MLX_SESSION_IDLE_TIMEOUT", "1800"))  # 30 min
-DEFAULT_MAX_QUEUE = int(os.getenv("MLX_MAX_QUEUE_SIZE", "64"))
+DEFAULT_MAX_SESSIONS = int(os.getenv("MLX_MAX_SESSIONS", "6"))
+DEFAULT_IDLE_TIMEOUT = float(os.getenv("MLX_SESSION_IDLE_TIMEOUT", "600"))
+DEFAULT_MAX_QUEUE = int(os.getenv("MLX_MAX_QUEUE_SIZE", "16"))
 
 
 class InferenceEngine:
@@ -267,31 +286,26 @@ class InferenceEngine:
         from agent.local_mlx import LocalMLXService
         self._service = LocalMLXService.instance()
 
-        # Request queue
         self._queue: Queue[Tuple[InferenceRequest, Future]] = Queue(
             maxsize=DEFAULT_MAX_QUEUE
         )
         self._worker_thread: Optional[threading.Thread] = None
         self._shutdown = threading.Event()
 
-        # Session caches
         self._sessions: OrderedDict[str, SessionCacheEntry] = OrderedDict()
         self._sessions_lock = threading.Lock()
         self._max_sessions = DEFAULT_MAX_SESSIONS
         self._idle_timeout = DEFAULT_IDLE_TIMEOUT
 
-        # Shared prefix
         self._prefix_cache = SharedPrefixCache()
 
-        # TurboQuant config
         from agent.local_mlx import get_turboquant_config
-        self._tq_config = get_turboquant_config()  # dict or None
+        self._tq_config = get_turboquant_config()
         self._use_turboquant = (
             TURBOQUANT_AVAILABLE
             and self._tq_config is not None
         )
 
-        # Start worker
         self._start_worker()
 
     @classmethod
@@ -302,12 +316,10 @@ class InferenceEngine:
             return cls._instance
 
     def submit(self, request: InferenceRequest) -> Future:
-        """Submit an inference request to the queue.
-
-        Returns a Future that resolves to an InferenceResult.
-        Raises queue.Full if the queue is at capacity.
-        """
+        """Submit an inference request to the queue."""
         future: Future = Future()
+        request.enqueued_at = time.monotonic()
+        future._mlx_request = request  # attach for cancellation
         self._queue.put((request, future), block=False)
         return future
 
@@ -321,12 +333,14 @@ class InferenceEngine:
             return len(self._sessions)
 
     def get_stats(self) -> Dict[str, Any]:
-        """Return engine statistics."""
         with self._sessions_lock:
             sessions_info = []
             for sid, entry in self._sessions.items():
                 sessions_info.append({
-                    "session_id": sid,
+                    "session_id": entry.session_id,
+                    "cache_key": sid,
+                    "model": entry.model_name,
+                    "backend": entry.backend,
                     "idle_seconds": round(entry.idle_seconds, 1),
                     "total_requests": entry.total_requests,
                     "prefix_tokens": entry.prefix_token_count,
@@ -344,7 +358,6 @@ class InferenceEngine:
         }
 
     def shutdown(self) -> None:
-        """Stop the worker thread and clean up."""
         self._shutdown.set()
         if self._worker_thread and self._worker_thread.is_alive():
             self._worker_thread.join(timeout=10.0)
@@ -362,10 +375,8 @@ class InferenceEngine:
         self._worker_thread.start()
 
     def _worker_loop(self) -> None:
-        """Process requests one at a time from the queue."""
         logger.info("MLX inference worker started")
         while not self._shutdown.is_set():
-            # Periodic idle session cleanup
             self._expire_idle_sessions()
 
             try:
@@ -373,10 +384,19 @@ class InferenceEngine:
             except Empty:
                 continue
 
-            t_dequeue = time.monotonic()
+            # Skip cancelled requests before spending GPU time
+            if request.is_cancelled:
+                future.set_exception(RuntimeError("Request cancelled"))
+                self._queue.task_done()
+                continue
+
             try:
-                result = self._process_request(request, t_dequeue)
-                future.set_result(result)
+                result = self._process_request(request)
+                # Don't persist result for cancelled requests
+                if request.is_cancelled:
+                    future.set_exception(RuntimeError("Request cancelled during processing"))
+                else:
+                    future.set_result(result)
             except Exception as exc:
                 logger.exception("Inference request %s failed", request.request_id)
                 future.set_exception(exc)
@@ -389,12 +409,9 @@ class InferenceEngine:
     # Request processing
     # ------------------------------------------------------------------
 
-    def _process_request(
-        self, request: InferenceRequest, t_dequeue: float
-    ) -> InferenceResult:
-        """Process a single inference request with session caching."""
+    def _process_request(self, request: InferenceRequest) -> InferenceResult:
         t_start = time.monotonic()
-        queue_wait_ms = (t_start - t_dequeue) * 1000 if t_dequeue else 0
+        queue_wait_ms = (t_start - request.enqueued_at) * 1000 if request.enqueued_at else 0
 
         model_name = request.model_name or os.getenv(
             "LOCAL_MLX_MODEL",
@@ -411,24 +428,40 @@ class InferenceEngine:
         # Skip prefix cache for models with custom cache requirements (e.g. hybrid SSM)
         has_custom_cache = hasattr(model, "make_cache")
         cache_hit = False
+        current_prefix_hash = _hash_messages(system_msgs) if system_msgs else ""
+
         if system_msgs and not has_custom_cache:
-            prefix_hash = _hash_messages(system_msgs)
-            if not self._prefix_cache.matches(prefix_hash, model_name):
+            if not self._prefix_cache.matches(current_prefix_hash, model_name):
                 self._prefix_cache.build(model, tokenizer_or_processor, system_msgs, model_name)
 
-        # Get or create session cache
-        session = self._get_or_create_session(request.session_id, model_name)
+        # Get or create session cache (keyed by session + backend + model)
+        cache_key = f"{request.session_id}:{backend}:{model_name}"
+        session = self._get_or_create_session(cache_key, request.session_id, model_name, backend)
         session.touch()
 
+        # Validate session cache staleness
+        if session.prompt_cache is not None:
+            stale = (
+                (current_prefix_hash and session.prefix_hash != current_prefix_hash)
+                or session.model_name != model_name
+                or session.backend != backend
+            )
+            if stale:
+                logger.info(
+                    "Invalidating stale session cache %s: prefix %s->%s model %s->%s",
+                    cache_key, session.prefix_hash[:8], current_prefix_hash[:8],
+                    session.model_name, model_name,
+                )
+                session.prompt_cache = None
+                session.prefix_hash = ""
+                session.prefix_token_count = 0
+
         from agent.local_mlx import (
-            _normalize_messages, _tool_instruction, _strip_think_artifacts,
-            _extract_json_object, _recover_xml_tool_calls,
-            _recover_terminal_tool_calls,
+            _normalize_messages, _extract_json_object,
+            _recover_xml_tool_calls, _recover_terminal_tool_calls,
         )
 
         normalized = _normalize_messages(request.messages)
-        # Don't inject tool instructions — Hermes already describes tools
-        # in its system prompt in the format the model was trained on.
 
         try:
             prompt_text = tokenizer_or_processor.apply_chat_template(
@@ -482,9 +515,6 @@ class InferenceEngine:
             }
 
             if has_custom_cache:
-                # Hybrid models (Qwen 3.5): use mlx_lm's own kv_bits param
-                # which triggers mlx_lm's maybe_quantize_kv_cache per-step.
-                # This correctly skips ArraysCache (SSM) layers.
                 if self._use_turboquant and self._tq_config:
                     gen_kwargs["kv_bits"] = int(self._tq_config.get("bits", 4))
                     logger.info(
@@ -503,6 +533,8 @@ class InferenceEngine:
                     )
                     session.prefix_token_count = self._prefix_cache.token_count
                     session.prefix_hash = self._prefix_cache.prompt_hash
+                    session.model_name = model_name
+                    session.backend = backend
                     gen_kwargs["prompt_cache"] = session.prompt_cache
                     cache_hit = True
                 except Exception as exc:
@@ -522,34 +554,19 @@ class InferenceEngine:
                 len(text), text[:200] if text else "",
             )
 
-        # Strip thinking blocks and special tokens from local model output.
-        # Carnice/Qwen outputs: "thinking...\n</think>\nactual response<|im_end|>"
-        # Standard models may use: "<think>...</think>actual response"
-        import re
-        visible_text = text or ""
-        # Handle standard <think>...</think> blocks
-        visible_text = re.sub(r'<think>.*?</think>\s*', '', visible_text, flags=re.DOTALL)
-        # Handle Carnice-style: everything before </think> is thinking
-        if '</think>' in visible_text:
-            visible_text = visible_text.split('</think>', 1)[-1]
-        # Strip orphan think tags and special tokens
-        visible_text = re.sub(r'</?think>\s*', '', visible_text)
-        visible_text = re.sub(r'<\|im_end\|>\s*', '', visible_text)
-        visible_text = re.sub(r'<\|endoftext\|>\s*', '', visible_text)
-        visible_text = visible_text.strip()
+        # --- FIX 1: Strip thinking FIRST, then parse tool calls ---
+        visible_text = _strip_thinking_and_special_tokens(text)
 
-        # Parse tool calls from various local model formats
-        from types import SimpleNamespace
-        import re
+        # Parse tool calls from CLEANED text only
         tool_calls = None
         content = visible_text
         finish_reason = "stop"
 
         if request.tools:
-            # 1. Gemma 4 native format: <|tool_call>call:func_name{json}<tool_call|>
+            # 1. Gemma 4 native format
             gemma_calls = re.findall(
                 r'<\|tool_call>call:(\w+)\{(.*?)\}<tool_call\|>',
-                text, re.DOTALL
+                visible_text, re.DOTALL
             )
             if gemma_calls:
                 tool_calls = []
@@ -557,7 +574,6 @@ class InferenceEngine:
                     try:
                         args = json.loads("{" + args_str + "}") if not args_str.startswith("{") else json.loads(args_str)
                     except (json.JSONDecodeError, Exception):
-                        # Try treating as key:value pairs
                         args = {}
                         for pair in args_str.split(","):
                             if ":" in pair:
@@ -577,9 +593,9 @@ class InferenceEngine:
                     content = None
                     finish_reason = "tool_calls"
 
-            # 2. JSON format: {"tool_calls": [{"name": ..., "arguments": ...}]}
+            # 2. JSON format
             if not tool_calls:
-                parsed = _extract_json_object(text)
+                parsed = _extract_json_object(visible_text)
                 if parsed and isinstance(parsed.get("tool_calls"), list):
                     tool_calls = []
                     for call in parsed["tool_calls"]:
@@ -602,16 +618,16 @@ class InferenceEngine:
                         content = None
                         finish_reason = "tool_calls"
 
-            # 3. XML format: <tool_call>...</tool_call> or <func_name>...</func_name>
+            # 3. XML format
             if not tool_calls:
-                tool_calls = _recover_xml_tool_calls(text, request.tools)
+                tool_calls = _recover_xml_tool_calls(visible_text, request.tools)
                 if tool_calls:
                     content = None
                     finish_reason = "tool_calls"
 
             # 4. Terminal code blocks
             if not tool_calls:
-                tool_calls = _recover_terminal_tool_calls(text, request.tools)
+                tool_calls = _recover_terminal_tool_calls(visible_text, request.tools)
                 if tool_calls:
                     content = None
                     finish_reason = "tool_calls"
@@ -642,16 +658,14 @@ class InferenceEngine:
     # ------------------------------------------------------------------
 
     def _get_or_create_session(
-        self, session_id: str, model_name: str
+        self, cache_key: str, session_id: str, model_name: str, backend: str
     ) -> SessionCacheEntry:
         with self._sessions_lock:
-            if session_id in self._sessions:
-                entry = self._sessions[session_id]
-                # Move to end (most recently used)
-                self._sessions.move_to_end(session_id)
+            if cache_key in self._sessions:
+                entry = self._sessions[cache_key]
+                self._sessions.move_to_end(cache_key)
                 return entry
 
-            # Enforce max sessions — expire oldest if at cap
             while len(self._sessions) >= self._max_sessions:
                 oldest_id, oldest = next(iter(self._sessions.items()))
                 logger.info(
@@ -660,12 +674,15 @@ class InferenceEngine:
                 )
                 del self._sessions[oldest_id]
 
-            entry = SessionCacheEntry(session_id=session_id)
-            self._sessions[session_id] = entry
+            entry = SessionCacheEntry(
+                session_id=session_id,
+                model_name=model_name,
+                backend=backend,
+            )
+            self._sessions[cache_key] = entry
             return entry
 
     def _expire_idle_sessions(self) -> None:
-        """Remove sessions that have been idle beyond the timeout."""
         now = time.monotonic()
         with self._sessions_lock:
             expired = [
@@ -677,12 +694,12 @@ class InferenceEngine:
                 del self._sessions[sid]
 
     def invalidate_session(self, session_id: str) -> bool:
-        """Explicitly invalidate a session's cache."""
+        """Invalidate all cache entries for a session (any backend/model)."""
         with self._sessions_lock:
-            if session_id in self._sessions:
-                del self._sessions[session_id]
-                return True
-            return False
+            to_remove = [k for k in self._sessions if k.startswith(f"{session_id}:")]
+            for k in to_remove:
+                del self._sessions[k]
+            return len(to_remove) > 0
 
 
 # ---------------------------------------------------------------------------
@@ -690,7 +707,6 @@ class InferenceEngine:
 # ---------------------------------------------------------------------------
 
 def _hash_messages(messages: List[Dict[str, Any]]) -> str:
-    """Deterministic hash of a message list for cache key comparison."""
     canonical = json.dumps(messages, sort_keys=True, ensure_ascii=True)
     return hashlib.sha256(canonical.encode()).hexdigest()[:16]
 
@@ -698,7 +714,6 @@ def _hash_messages(messages: List[Dict[str, Any]]) -> str:
 def _split_system_messages(
     messages: List[Dict[str, Any]],
 ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
-    """Split messages into leading system messages and the rest."""
     system: List[Dict[str, Any]] = []
     rest: List[Dict[str, Any]] = []
     in_system = True
@@ -720,7 +735,6 @@ def _make_cache_for_model(model: Any) -> List[Any]:
     """
     if hasattr(model, "make_cache"):
         return model.make_cache()
-    # VLM models wrap a language_model that has make_cache
     if hasattr(model, "language_model") and hasattr(model.language_model, "make_cache"):
         return model.language_model.make_cache()
     from mlx_lm.models.llama import KVCache

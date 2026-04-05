@@ -227,6 +227,9 @@ class _Handler(BaseHTTPRequestHandler):
         try:
             result = future.result(timeout=timeout)
         except TimeoutError:
+            # Cancel the in-flight request to avoid wasting GPU time
+            if hasattr(future, '_mlx_request'):
+                future._mlx_request.cancel()
             self._write_json(504, {
                 "error": "inference timeout",
                 "session_id": session_id,
